@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""verify — org-wide verification front door (the Verifier, promoted).
+
+Any agent or loop can route a deliverable through this. It is the same
+Verifier that gates Forge builds (agents/forge/verifier, L1) given a
+general-purpose entry point; forge-verifier remains the Forge-lane caller.
+
+Design guarantees (hardening mandate 2026-07-03):
+  Independence   — judgment runs in a FRESH claude subprocess that receives
+                   only: the deliverable, the done-bar checklist, and live
+                   source paths. It never sees the maker's reasoning.
+  Assume-wrong   — standing instruction is "this output is wrong, find the
+                   break", not "check this".
+  Done-bars      — verification only runs against a written pass/fail
+                   checklist. No confidence percentages, ever.
+  Deterministic  — scripted checks run first (exists, parses, renders,
+                   em-dash scan); the model only judges what scripts can't.
+  Live sources   — reads the actual files fresh off disk at verify time.
+  Iteration cap  — 3 rounds per task name, then verdict ESCALATE with a
+                   plain-English blocker list for the operator.
+
+Usage:
+  verify --task <name> --deliverable <path> [--deliverable <path> ...]
+         --donebar <checklist.md> [--source <path> ...] [--outbound]
+         [--json]
+
+Exit codes: 0 PASS · 1 FAIL · 2 ESCALATE (cap hit) · 3 usage/infra error
+Verdicts + reports land in ~/.forge-suite/outputs/verifier/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+FORGE_HOME = Path.home() / ".forge-suite"
+OUT_DIR = FORGE_HOME / "outputs" / "verifier"
+STATE_DIR = FORGE_HOME / "state" / "verifier"
+PHX = ZoneInfo("America/Phoenix")
+MAX_ROUNDS = 3
+
+EM_DASH = "—"
+
+
+def _now() -> str:
+    return datetime.now(PHX).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _claude_bin() -> str | None:
+    known = Path.home() / ".local" / "bin" / "claude"
+    return str(known) if known.exists() else shutil.which("claude")
+
+
+def _rounds(task: str) -> dict:
+    f = STATE_DIR / "rounds.json"
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return {}
+
+
+def _bump_round(task: str) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = STATE_DIR / "rounds.json"
+    data = _rounds(task)
+    entry = data.get(task, {"count": 0})
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last"] = _now()
+    data[task] = entry
+    f.write_text(json.dumps(data, indent=1))
+    return entry["count"]
+
+
+def reset_rounds(task: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = STATE_DIR / "rounds.json"
+    data = _rounds(task)
+    if task in data:
+        del data[task]
+        f.write_text(json.dumps(data, indent=1))
+
+
+def deterministic_checks(deliverables: list[Path], sources: list[Path],
+                         outbound: bool) -> list[dict]:
+    checks = []
+
+    def add(cid: str, ok: bool, evidence: str):
+        checks.append({"id": cid, "pass": bool(ok), "evidence": evidence})
+
+    for d in deliverables:
+        add(f"exists:{d.name}", d.exists(), str(d))
+        if not d.exists():
+            continue
+        add(f"nonempty:{d.name}", d.stat().st_size > 0, f"{d.stat().st_size} bytes")
+        if d.suffix == ".json":
+            try:
+                json.loads(d.read_text())
+                add(f"parses:{d.name}", True, "valid JSON")
+            except Exception as e:
+                add(f"parses:{d.name}", False, f"JSON parse error: {e}")
+        elif d.suffix == ".py":
+            r = subprocess.run([sys.executable, "-m", "py_compile", str(d)],
+                               capture_output=True, text=True)
+            add(f"parses:{d.name}", r.returncode == 0, r.stderr.strip()[:200] or "compiles")
+        if outbound and d.suffix in (".md", ".txt", ".html"):
+            body = d.read_text(errors="ignore")
+            add(f"no_em_dash:{d.name}", EM_DASH not in body,
+                "outbound copy must not contain em-dashes"
+                if EM_DASH in body else "clean")
+    for s in sources:
+        add(f"source_live:{s.name}", s.exists(), str(s))
+    return checks
+
+
+def llm_judgment(deliverables: list[Path], donebar: Path,
+                 sources: list[Path], det: list[dict]) -> tuple[bool | None, str]:
+    claude = _claude_bin()
+    if not claude:
+        return None, "claude CLI not found — failing closed"
+
+    def _read(p: Path, cap: int = 30000) -> str:
+        try:
+            t = p.read_text(errors="ignore")
+        except Exception as e:
+            return f"<<UNREADABLE: {e}>>"
+        if len(t) <= cap:
+            return t
+        return t[: cap // 2] + f"\n<<... {len(t) - cap} chars elided ...>>\n" + t[-cap // 2:]
+
+    prompt = (
+        "You are an independent verifier. ASSUME THIS DELIVERABLE IS WRONG — "
+        "your job is to find the specific way it breaks its done-bar, not to "
+        "confirm it looks complete. A structurally complete deliverable that "
+        "says false or unsupported things MUST fail. Score ONLY against the "
+        "done-bar checklist below — every item pass/fail. Never use confidence "
+        "percentages. If an item cannot be verified from the material given, "
+        "it FAILS (unverifiable = not done).\n\n"
+        "=== DONE-BAR CHECKLIST ===\n" + _read(donebar) + "\n\n"
+        "=== DETERMINISTIC CHECK RESULTS (already run against live files) ===\n"
+        + "\n".join(f"[{'PASS' if c['pass'] else 'FAIL'}] {c['id']}: {c['evidence']}" for c in det)
+        + "\n\n=== DELIVERABLE(S), read fresh from disk ===\n"
+        + "\n\n".join(f"--- {d} ---\n{_read(d)}" for d in deliverables)
+        + ("\n\n=== LIVE SOURCE MATERIAL ===\n"
+           + "\n\n".join(f"--- {s} ---\n{_read(s, 15000)}" for s in sources) if sources else "")
+        + "\n\nReturn ONLY JSON: {\"pass\": true|false, "
+          "\"failed_items\": [\"done-bar item + why, plain English\"], "
+          "\"break_found\": \"the sharpest defect, or null\"}"
+    )
+    try:
+        r = subprocess.run([claude, "--model", "claude-sonnet-5", "-p", prompt],
+                           capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return None, "verifier judgment timed out — failing closed"
+    if r.returncode != 0:
+        return None, f"claude exited {r.returncode}: {r.stderr.strip()[:200]}"
+    m = re.search(r"\{.*\}", r.stdout, re.DOTALL)
+    if not m:
+        return None, "no JSON verdict in judgment output — failing closed"
+    try:
+        v = json.loads(m.group(0))
+    except Exception as e:
+        return None, f"verdict JSON unparseable: {e}"
+    detail = "; ".join(v.get("failed_items") or []) or (v.get("break_found") or "all done-bar items pass")
+    return bool(v.get("pass")), detail
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="verify")
+    ap.add_argument("--task", required=True, help="task name (iteration cap keys on this)")
+    ap.add_argument("--deliverable", action="append", required=True)
+    ap.add_argument("--donebar", required=True)
+    ap.add_argument("--source", action="append", default=[])
+    ap.add_argument("--outbound", action="store_true",
+                    help="deliverable is outward-facing copy (enables em-dash scan)")
+    ap.add_argument("--reset-rounds", action="store_true",
+                    help="clear the iteration counter for this task and exit")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if args.reset_rounds:
+        reset_rounds(args.task)
+        print(f"rounds reset for {args.task}")
+        return 0
+
+    donebar = Path(args.donebar).expanduser()
+    if not donebar.exists():
+        print(f"done-bar checklist not found: {donebar}", file=sys.stderr)
+        return 3
+    deliverables = [Path(d).expanduser() for d in args.deliverable]
+    sources = [Path(s).expanduser() for s in args.source]
+
+    rnd = _bump_round(args.task)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(PHX).strftime("%Y%m%d_%H%M%S")
+
+    if rnd > MAX_ROUNDS:
+        blockers = (f"Task '{args.task}' has failed verification {MAX_ROUNDS} times. "
+                    f"Halting the build-verify loop and escalating to the operator. "
+                    f"Prior verdicts are in {OUT_DIR}. A human call is needed before round {rnd}.")
+        report = OUT_DIR / f"{ts}_{args.task}_ESCALATE.md"
+        report.write_text(f"# Verifier escalation — {args.task}\n\n{blockers}\n")
+        print(json.dumps({"verdict": "ESCALATE", "round": rnd, "report": str(report)})
+              if args.json else f"ESCALATE (round {rnd} > cap {MAX_ROUNDS}) — {report}")
+        return 2
+
+    det = deterministic_checks(deliverables, sources, args.outbound)
+    det_fail = [c for c in det if not c["pass"]]
+    if det_fail:
+        passed, detail = False, "deterministic checks failed: " + "; ".join(
+            f"{c['id']} ({c['evidence']})" for c in det_fail[:6])
+    else:
+        passed, detail = llm_judgment(deliverables, donebar, sources, det)
+        if passed is None:
+            passed, detail = False, f"FAIL-CLOSED: {detail}"
+
+    verdict = "PASS" if passed else "FAIL"
+    if passed:
+        reset_rounds(args.task)
+    report = OUT_DIR / f"{ts}_{args.task}_{verdict}.md"
+    report.write_text(
+        f"# Verifier verdict — {args.task}\n\n"
+        f"**{verdict}** (round {rnd}/{MAX_ROUNDS}) at {_now()} Phoenix\n\n"
+        f"Done-bar: {donebar}\n"
+        f"Deliverables: {', '.join(str(d) for d in deliverables)}\n\n"
+        f"## Deterministic checks\n"
+        + "\n".join(f"- [{'x' if c['pass'] else ' '}] {c['id']} — {c['evidence']}" for c in det)
+        + f"\n\n## Judgment\n{detail}\n"
+    )
+    out = {"verdict": verdict, "round": rnd, "detail": detail, "report": str(report)}
+    print(json.dumps(out) if args.json else f"{verdict} (round {rnd}) — {detail}\n{report}")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

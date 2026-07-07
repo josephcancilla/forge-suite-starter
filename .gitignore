@@ -1,0 +1,24 @@
+# Never commit secrets or credentials
+.env
+.env.*
+*.env
+*token*
+*secret*
+*.pem
+*.key
+credentials*.json
+
+# Runtime data — not part of the suite
+state/
+logs/
+outputs/
+ledger/
+queue/
+journal/
+*.log
+*.transcript.jsonl
+
+# OS / editor noise
+.DS_Store
+__pycache__/
+*.pyc

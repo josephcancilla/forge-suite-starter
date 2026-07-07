@@ -1,0 +1,19 @@
+{
+  "current_tier": "L0",
+  "l0_clean_runs": 0,
+  "l1_clean_runs": 0,
+  "l2_clean_runs": 0,
+  "last_reset": null,
+  "last_clean_run": null,
+  "thresholds": {
+    "l0_to_l1": 3,
+    "l1_to_l2": 3,
+    "l2_to_l3": 3
+  },
+  "promotion_history": [],
+  "notes": "Scaffolded at L0. CLI-only orchestrator. Delegates to forge-specman, forge-architect, forge-builder, forge-verifier.",
+  "last_run": null,
+  "graduated_at": null,
+  "graduated_by": null,
+  "runs": []
+}

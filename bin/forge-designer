@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# forge-designer — Frontend-design skill for web builds + universal UX pass (v2 U3).
+#
+# Modes:
+#   default (web build): forge-designer <name>
+#     Invokes frontend-design skill for spec at ~/.forge-suite/queue/forge/<name>_spec.md.
+#     Requires spec type=web-app or web-site. 120K/25K token bucket.
+#
+#   ux-review (v2 U3):   forge-designer --mode=ux-review --target=<path>
+#     Reads any file (spec, CLAUDE.md, bin, doc) and returns clarity/readability
+#     notes + prompt-design suggestions. No type gate. 30K/6K token bucket.
+#
+# Usage:
+#   forge-designer <name>                                    Web build (existing)
+#   forge-designer <name> --dry-run                          Write web build to /tmp/
+#   forge-designer --mode=ux-review --target=<path>          UX pass on any file
+#   forge-designer --mode=ux-review --target=<path> --dry-run  UX pass, write to /tmp/
+#   forge-designer --help                                    Show usage
+#
+# Paths:
+#   Spec (reads):        ~/.forge-suite/queue/forge/<name>_spec.md
+#   Web design output:   <project target dir from spec>
+#   Web summary:         ~/.forge-suite/outputs/forge/designer/<TS>_<name>_design.md
+#   UX review output:    ~/.forge-suite/outputs/forge/designer/ux-reviews/<TS>_<basename>_ux.md
+#   Skill:               ~/.claude/skills/frontend-design/
+#
+# Exit codes:
+#   0  artifacts produced (design or UX review)
+#   1  spec invalid / target missing / arg error
+#   3  circuit breaker tripped
+#   4  frontend-design skill not installed (web build only)
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+set -euo pipefail
+
+FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+QUEUE_DIR="$FORGE_HOME/queue/forge"
+OUTPUT_DIR="$FORGE_HOME/outputs/forge/designer"
+UX_OUTPUT_DIR="$OUTPUT_DIR/ux-reviews"
+JOURNAL_DIR="$FORGE_HOME/journal/pending"
+AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+SKILL_DIR="$HOME/.claude/skills/frontend-design"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMESTAMP="$(date +%Y%m%d_%H%M)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$OUTPUT_DIR" "$UX_OUTPUT_DIR" "$JOURNAL_DIR"
+
+die() { echo "forge-designer: $*" >&2; exit "${2:-1}"; }
+log_action() { echo "[$NOW_ISO] forge-designer $*" >> "$AUDIT_LOG"; }
+
+if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+  sed -n '1,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+# Parse args — detect mode first
+MODE="web-build"
+TARGET=""
+NAME=""
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --mode=ux-review)  MODE="ux-review" ;;
+    --mode=*)          die "unknown mode: ${arg#--mode=}" ;;
+    --target=*)        TARGET="${arg#--target=}" ;;
+    --dry-run)         DRY_RUN=true ;;
+    --help)            sed -n '1,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)                die "unknown flag: $arg" ;;
+    *)                 NAME="$arg" ;;
+  esac
+done
+
+# Circuit breaker (both modes)
+if command -v forge-cb &>/dev/null; then
+  forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
+fi
+
+# ========== UX REVIEW MODE (v2 U3) ==========
+if [[ "$MODE" == "ux-review" ]]; then
+  [[ -z "$TARGET" ]] && die "--mode=ux-review requires --target=<path>"
+  [[ ! -f "$TARGET" ]] && die "target file not found: $TARGET"
+
+  TARGET_BASENAME="$(basename "$TARGET" | sed 's/\.[^.]*$//')"
+  if $DRY_RUN; then
+    UX_REVIEW_FILE="/tmp/forge-designer-ux-${TARGET_BASENAME}-${TIMESTAMP}.md"
+  else
+    UX_REVIEW_FILE="$UX_OUTPUT_DIR/${TIMESTAMP}_${TARGET_BASENAME}_ux.md"
+  fi
+
+  log_action "ux_review_start target=$TARGET"
+
+  PROMPT_FILE="$(mktemp /tmp/forge-designer-ux-prompt.XXXXXX)"
+  LOG_FILE="/tmp/forge-designer-ux-${TIMESTAMP}.log"
+  trap "rm -f $PROMPT_FILE" EXIT
+
+  cat > "$PROMPT_FILE" <<UX_TASK
+You are forge-designer running in UX-REVIEW mode. Read the target file and produce a clarity/readability review, plus up to three prompt-design suggestions. This is a v2 U3 universal UX pass — no type gate, no design artifacts, just a review.
+
+Target file: $TARGET
+Target basename: $TARGET_BASENAME
+Timestamp: $TIMESTAMP
+Output file: $UX_REVIEW_FILE
+
+Target contents:
+\`\`\`
+$(cat "$TARGET")
+\`\`\`
+
+Required action — write a single markdown file to $UX_REVIEW_FILE with this exact structure:
+
+\`\`\`markdown
+---
+target: $TARGET
+reviewed_by: forge-designer-ux-review
+timestamp: $TIMESTAMP
+mode: ux-review
+---
+
+# UX Review: $TARGET_BASENAME
+
+## Clarity Score: N/5
+
+<one-sentence justification for the score>
+
+## Readability Flow
+
+<one paragraph describing how the file reads top-to-bottom: where attention drops, where sections feel redundant, what a first-time reader would miss on a skim, whether jargon density is appropriate for the intended reader>
+
+## Prompt-Design Suggestions
+
+1. <concrete, action-oriented suggestion — e.g., "move the 'Hard failures' section above 'Soft failures' so refuse-conditions land before allow-with-flag conditions">
+2. <...>
+3. <...>
+
+OR if the file is already strong:
+
+**None — ship as-is.** <one-sentence rationale for why no changes recommended>
+
+## AWAITING REVIEW
+\`\`\`
+
+Rubric for Clarity Score:
+- 5/5 — Immediately usable by target reader; zero ambiguity; sections ordered by priority.
+- 4/5 — Clear intent; minor ordering or phrasing nits.
+- 3/5 — Usable but would benefit from one structural change.
+- 2/5 — Target reader would miss something important on first pass.
+- 1/5 — Structure or language actively obscures the intent.
+
+Hard constraints:
+- No emojis in output.
+- Action-oriented language — imperative verbs ("move X", "delete Y", "rename Z"), not "consider" or "maybe".
+- Suggestions must be SPECIFIC to this file, not generic writing advice.
+- If the file is a SpecMan spec: focus on whether Diagnosis reads coherently, whether blind-spot Qs are genuine questions vs filler, whether inferred fields are flagged.
+- If the file is a scaffolded CLAUDE.md: focus on whether the 8-field Behavior Contract reads as enforceable and whether the Silence contract is unambiguous.
+- If the file is a bin script: focus on whether usage doc matches actual flag behavior and whether error messages are actionable.
+- No ANTHROPIC_API_KEY in output.
+- Do not modify the target file. Read-only.
+UX_TASK
+
+  "$CLAUDE_BIN" --model claude-sonnet-5 \
+    --permission-mode acceptEdits \
+    --output-format text \
+    -p "$(cat "$PROMPT_FILE")" \
+    > /dev/null 2>"$LOG_FILE" || {
+    log_action "ux_review_error target=$TARGET see_log=$LOG_FILE"
+    echo "forge-designer: UX review failed. Log: $LOG_FILE" >&2
+    exit 1
+  }
+
+  if [[ ! -s "$UX_REVIEW_FILE" ]]; then
+    log_action "ux_review_error target=$TARGET no_output"
+    echo "forge-designer: UX review completed but no output file produced. Log: $LOG_FILE" >&2
+    exit 1
+  fi
+
+  log_action "ux_review_complete target=$TARGET output=$UX_REVIEW_FILE"
+
+  echo ""
+  echo "forge-designer: UX review complete."
+  echo "  Target:  $TARGET"
+  echo "  Review:  $UX_REVIEW_FILE"
+  echo ""
+  exit 0
+fi
+
+# ========== WEB BUILD MODE (existing) ==========
+[[ -z "$NAME" ]] && die "web-build mode requires <name> positional arg"
+
+if [[ ! -f "$SKILL_DIR/SKILL.md" ]]; then
+  echo "forge-designer: \`frontend-design\` skill not installed."
+  echo "Install it first:"
+  echo "  forge-skill-install https://github.com/anthropics/skills/tree/main/skills/frontend-design"
+  log_action "hard_fail skill_missing frontend-design"
+  exit 4
+fi
+
+SPEC_FILE="$QUEUE_DIR/${NAME}_spec.md"
+[[ ! -f "$SPEC_FILE" ]] && die "spec not found: $SPEC_FILE"
+
+SPEC_TYPE=$(awk '/^type:/ {print $2; exit}' "$SPEC_FILE" 2>/dev/null || echo "agent")
+if [[ "$SPEC_TYPE" != "web-app" && "$SPEC_TYPE" != "web-site" ]]; then
+  die "spec type is '$SPEC_TYPE' — web-build mode only runs for type=web-app|web-site. Use --mode=ux-review --target=<path> for a universal UX pass." 1
+fi
+
+log_action "design_start $NAME type=$SPEC_TYPE"
+
+SUMMARY_FILE="$OUTPUT_DIR/${TIMESTAMP}_${NAME}_design.md"
+PROMPT_FILE="$(mktemp /tmp/forge-designer-prompt.XXXXXX)"
+LOG_FILE="/tmp/forge-designer-${NAME}-${TIMESTAMP}.log"
+trap "rm -f $PROMPT_FILE" EXIT
+
+SKILL_CONTENT="$(cat "$SKILL_DIR/SKILL.md")"
+
+cat "$FORGE_HOME/agents/forge/designer/CLAUDE.md" > "$PROMPT_FILE"
+
+cat >> "$PROMPT_FILE" <<DESIGNER_TASK
+
+---
+
+## Skill Contract (frontend-design)
+
+$SKILL_CONTENT
+
+---
+
+## TASK — Design pass: $NAME (type=$SPEC_TYPE)
+
+Spec file: $SPEC_FILE
+Summary file: $SUMMARY_FILE
+Dry run: $DRY_RUN
+Timestamp: $TIMESTAMP
+
+Spec contents:
+$(cat "$SPEC_FILE")
+
+Required actions using the frontend-design skill (Skill tool) + Write tool:
+
+1. Parse spec: extract \`stack\`, \`pages[]\`, \`deploy_target\`, \`design_tokens_source\`, brand context (e.g. one brand warm and bold, another editorial and minimal, or unbranded).
+2. Invoke the \`frontend-design\` skill to generate page layouts and components per \`pages[]\`.
+3. Write HTML/CSS/JSX artifacts to the \`deploy_target\` path declared in the spec (or /tmp/forge-designer-$NAME/ if dry-run).
+4. Write \`design-tokens.json\` to the same dir — colors, spacing, typography matching brand direction.
+5. Write $SUMMARY_FILE — list of files generated, brand tokens applied, skill version used, any soft-failure flags, final line "AWAITING BUILDER COMMIT".
+6. Write $JOURNAL_DIR/designer_${TIMESTAMP}.md — spec input, design artifacts produced, CB token estimate.
+
+Hard constraints:
+- No ANTHROPIC_API_KEY in any output.
+- Brand tokens must match the declared brand direction (e.g. one brand warm and bold, another editorial and minimal; default clean neutral).
+- Do not activate or deploy. Write files only.
+DESIGNER_TASK
+
+"$CLAUDE_BIN" --model claude-sonnet-5 \
+  --permission-mode acceptEdits \
+  --output-format text \
+  -p "$(cat "$PROMPT_FILE")" \
+  > /dev/null 2>"$LOG_FILE" || {
+  log_action "design_error $NAME see_log=$LOG_FILE"
+  echo "forge-designer: Claude run failed. Log: $LOG_FILE" >&2
+  exit 1
+}
+
+log_action "design_complete $NAME awaiting_builder_commit"
+
+echo ""
+echo "forge-designer: design artifacts produced for '$NAME'."
+echo "  Summary: $SUMMARY_FILE"
+echo ""
+echo "Builder will include these in the final commit."
+
+exit 0

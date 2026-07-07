@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# forge-verifier — Post-build gate: deterministic checks + Claude DOF/spec verdict.
+#
+# Usage:
+#   forge-verifier <name>           Run all checks + Claude verdict; exit 0=PASS, 30=FAIL
+#   forge-verifier <name> --dry-run Run checks a-g only, skip Claude; write to /tmp/
+#   forge-verifier --help           Show usage
+#
+# Checks (deterministic, no Claude):
+#   a. spec exists at queue/forge/<name>_spec.md
+#   b. agents/<name>/CLAUDE.md exists and contains a Behavior Contract section
+#   c. agents/<name>/dof.md exists
+#   d. bin/<name> exists and is executable
+#   e. bin/<name> --dry-run exits 0 within 120s (falls back to --help)
+#   f. agents/<name>/graduation_counter.json parses as JSON
+#   g. if spec declares MCPs required, CLAUDE.md declares a credential pattern
+#
+# Then (unless --dry-run): one Claude call judges DOF compliance + spec fidelity.
+#
+# Outputs:
+#   Verdict JSON:   ~/.forge-suite/queue/forge/verdicts/<name>_verdict.json
+#   Summary:        ~/.forge-suite/outputs/forge/verifier/<TS>_<name>_verdict.md
+#   Dry-run:        /tmp/forge-verifier-<name>/
+#
+# Exit codes:
+#   0   PASS
+#   1   internal error (I/O failure, unexpected condition)
+#   20  --help / usage
+#   21  spec not found
+#   22  invalid name format
+#   30  FAIL (one or more checks failed)
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+set -euo pipefail
+
+FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+QUEUE_DIR="$FORGE_HOME/queue/forge"
+VERDICT_DIR="$FORGE_HOME/queue/forge/verdicts"
+OUTPUT_DIR="$FORGE_HOME/outputs/forge/verifier"
+AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMESTAMP="$(date +%Y%m%d_%H%M)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$VERDICT_DIR" "$OUTPUT_DIR"
+
+die()        { echo "forge-verifier: $*" >&2; exit 1; }
+log_action() { echo "[$NOW_ISO] forge-verifier $*" >> "$AUDIT_LOG"; }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+  sed -n '1,32p' "$0" | sed 's/^# \{0,1\}//'
+  exit 20
+fi
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+NAME="$1"
+shift
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    *) die "unknown flag: $arg" ;;
+  esac
+done
+
+# Validate name format
+[[ ! "$NAME" =~ ^[a-z][a-z0-9-]+$ ]] && { echo "forge-verifier: invalid kebab-case name: $NAME" >&2; exit 22; }
+
+# Circuit breaker preflight (forge bucket; skip if not installed)
+if command -v forge-cb &>/dev/null; then
+  PYTHON_PATH_SAVE="$PATH"
+  export PATH="/usr/bin:/usr/local/bin:$PATH"
+  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
+  export PATH="$PYTHON_PATH_SAVE"
+fi
+
+# ── Output destinations ───────────────────────────────────────────────────────
+if $DRY_RUN; then
+  WORK_DIR="/tmp/forge-verifier-$NAME"
+  mkdir -p "$WORK_DIR"
+  VERDICT_JSON="$WORK_DIR/${NAME}_verdict.json"
+  SUMMARY_MD="$WORK_DIR/${TIMESTAMP}_${NAME}_verdict.md"
+else
+  VERDICT_JSON="$VERDICT_DIR/${NAME}_verdict.json"
+  SUMMARY_MD="$OUTPUT_DIR/${TIMESTAMP}_${NAME}_verdict.md"
+fi
+
+SPEC_FILE="$QUEUE_DIR/${NAME}_spec.md"
+AGENT_DIR="$FORGE_HOME/agents/$NAME"
+CLAUDE_MD="$AGENT_DIR/CLAUDE.md"
+DOF_MD="$AGENT_DIR/dof.md"
+BIN_FILE="$FORGE_HOME/bin/$NAME"
+COUNTER_JSON="$AGENT_DIR/graduation_counter.json"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+CHECKS_JSON=""   # accumulates JSON check objects
+OVERALL_PASS=true
+
+add_check() {
+  local id="$1" pass="$2" detail="$3"
+  local pass_val="true"
+  [[ "$pass" != "true" ]] && { pass_val="false"; OVERALL_PASS=false; }
+  local entry
+  entry="$(printf '{"id":"%s","pass":%s,"detail":"%s"}' \
+    "$id" "$pass_val" "$(echo "$detail" | sed 's/"/\\"/g')")"
+  if [[ -z "$CHECKS_JSON" ]]; then
+    CHECKS_JSON="$entry"
+  else
+    CHECKS_JSON="${CHECKS_JSON},${entry}"
+  fi
+}
+
+# ── CHECK a: spec exists ──────────────────────────────────────────────────────
+if [[ -f "$SPEC_FILE" ]]; then
+  add_check "a_spec_exists" "true" "spec found at $SPEC_FILE"
+else
+  log_action "refusal name=$NAME reason=spec_not_found"
+  echo "forge-verifier: spec not found: $SPEC_FILE — run forge-specman first." >&2
+  exit 21
+fi
+
+# ── CHECK b: CLAUDE.md exists + has Behavior Contract ────────────────────────
+if [[ ! -f "$CLAUDE_MD" ]]; then
+  add_check "b_claude_md" "false" "CLAUDE.md missing at $CLAUDE_MD"
+elif ! grep -q "Behavior Contract" "$CLAUDE_MD"; then
+  add_check "b_claude_md" "false" "CLAUDE.md exists but no 'Behavior Contract' section found"
+else
+  add_check "b_claude_md" "true" "CLAUDE.md present and contains Behavior Contract section"
+fi
+
+# ── CHECK c: dof.md exists ────────────────────────────────────────────────────
+if [[ -f "$DOF_MD" ]]; then
+  add_check "c_dof_md" "true" "dof.md found at $DOF_MD"
+else
+  add_check "c_dof_md" "false" "dof.md missing at $DOF_MD"
+fi
+
+# ── CHECK d: bin exists and is executable ─────────────────────────────────────
+if [[ ! -f "$BIN_FILE" ]]; then
+  add_check "d_bin_exists" "false" "bin missing at $BIN_FILE"
+elif [[ ! -x "$BIN_FILE" ]]; then
+  add_check "d_bin_exists" "false" "bin exists but not executable: $BIN_FILE"
+else
+  add_check "d_bin_exists" "true" "bin exists and is executable: $BIN_FILE"
+fi
+
+# ── CHECK e: bin --dry-run (or --help) exits 0 within 120s ───────────────────
+# macOS has no GNU timeout. Use bash-native background process + kill.
+DRY_RUN_FALLBACK=false
+CHECK_E_PASS=false
+CHECK_E_DETAIL=""
+
+if [[ -x "$BIN_FILE" ]]; then
+  # Try --dry-run first — capture stderr so we can include it in the FAIL detail
+  STDERR_TMP1="$(mktemp /tmp/forge-verifier-drystderr.XXXXXX)"
+  "$BIN_FILE" --dry-run >/dev/null 2>"$STDERR_TMP1" &
+  SUBPID=$!
+  ELAPSED=0
+  while kill -0 "$SUBPID" 2>/dev/null && [[ $ELAPSED -lt 120 ]]; do
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+  done
+
+  if kill -0 "$SUBPID" 2>/dev/null; then
+    # Still running after 120s — kill it
+    kill "$SUBPID" 2>/dev/null || true
+    wait "$SUBPID" 2>/dev/null || true
+    rm -f "$STDERR_TMP1"
+    CHECK_E_DETAIL="bin --dry-run timed out after 120s"
+    CHECK_E_PASS=false
+  else
+    # Capture exit code without letting set -e abort the verifier
+    EXIT_CODE=0
+    wait "$SUBPID" || EXIT_CODE=$?
+    STDERR_SNIPPET1="$(tail -3 "$STDERR_TMP1" 2>/dev/null | tr '\n' ' ' | sed 's/["\]/\\&/g')"
+    rm -f "$STDERR_TMP1"
+    if [[ $EXIT_CODE -eq 0 ]]; then
+      CHECK_E_PASS=true
+      CHECK_E_DETAIL="bin --dry-run exited 0 (in ${ELAPSED}s)"
+    else
+      # --dry-run returned non-zero — try --help as fallback
+      STDERR_TMP2="$(mktemp /tmp/forge-verifier-helpstderr.XXXXXX)"
+      "$BIN_FILE" --help >/dev/null 2>"$STDERR_TMP2" &
+      SUBPID2=$!
+      ELAPSED2=0
+      while kill -0 "$SUBPID2" 2>/dev/null && [[ $ELAPSED2 -lt 120 ]]; do
+        sleep 1
+        ELAPSED2=$((ELAPSED2 + 1))
+      done
+      if kill -0 "$SUBPID2" 2>/dev/null; then
+        kill "$SUBPID2" 2>/dev/null || true
+        wait "$SUBPID2" 2>/dev/null || true
+        rm -f "$STDERR_TMP2"
+        CHECK_E_DETAIL="bin --dry-run exit ${EXIT_CODE} (stderr: ${STDERR_SNIPPET1}); --help fallback timed out after 120s"
+        CHECK_E_PASS=false
+      else
+        EXIT_CODE2=0
+        wait "$SUBPID2" || EXIT_CODE2=$?
+        rm -f "$STDERR_TMP2"
+        if [[ $EXIT_CODE2 -eq 0 ]]; then
+          DRY_RUN_FALLBACK=true
+          CHECK_E_PASS=true
+          CHECK_E_DETAIL="bin --dry-run exit ${EXIT_CODE} (no --dry-run support); --help exit 0 (fallback used)"
+        else
+          CHECK_E_DETAIL="bin --dry-run exit ${EXIT_CODE} (stderr: ${STDERR_SNIPPET1}); --help exit ${EXIT_CODE2}"
+          CHECK_E_PASS=false
+        fi
+      fi
+    fi
+  fi
+else
+  CHECK_E_DETAIL="bin not executable — skipped"
+  CHECK_E_PASS=false
+fi
+
+add_check "e_bin_dry_run" "$CHECK_E_PASS" "$CHECK_E_DETAIL"
+
+# ── CHECK f: graduation_counter.json parses as JSON ──────────────────────────
+if [[ ! -f "$COUNTER_JSON" ]]; then
+  add_check "f_counter_json" "false" "graduation_counter.json missing at $COUNTER_JSON"
+else
+  if /usr/bin/python3 -c "import json,sys; json.load(open('$COUNTER_JSON'))" 2>/dev/null; then
+    add_check "f_counter_json" "true" "graduation_counter.json is valid JSON"
+  else
+    add_check "f_counter_json" "false" "graduation_counter.json exists but is not valid JSON"
+  fi
+fi
+
+# ── CHECK g: if MCPs required, CLAUDE.md declares credential pattern ──────────
+# ERE alternation — \| inside grep -E matches a literal pipe, not "or"
+CRED_PATTERNS="MCP|LIB|DSF|STATIC|SUB"
+MCP_SECTION=$(grep -A3 "^## MCPs required" "$SPEC_FILE" 2>/dev/null | tail -n3 | grep -v "^##" || true)
+MCP_DECLARED=false
+if echo "$MCP_SECTION" | grep -qiE "none|^$"; then
+  # No MCPs declared — check g passes trivially
+  add_check "g_credential_pattern" "true" "spec declares no MCPs required — credential pattern check n/a"
+elif [[ -z "$MCP_SECTION" ]]; then
+  # No MCPs section at all — treat as none
+  add_check "g_credential_pattern" "true" "no MCPs section in spec — credential pattern check n/a"
+else
+  # MCPs required — verify CLAUDE.md declares a pattern
+  if [[ -f "$CLAUDE_MD" ]] && grep -qE "$CRED_PATTERNS" "$CLAUDE_MD"; then
+    add_check "g_credential_pattern" "true" "spec declares MCPs and CLAUDE.md contains credential pattern declaration"
+  else
+    add_check "g_credential_pattern" "false" "spec declares MCPs but CLAUDE.md has no credential pattern (MCP/LIB/DSF/STATIC/SUB)"
+  fi
+fi
+
+# ── Dry-run path: skip Claude, write verdict ──────────────────────────────────
+CLAUDE_VERDICT=""
+NOTES=""
+
+if $DRY_RUN; then
+  CLAUDE_VERDICT="skipped (dry-run)"
+  NOTES="Deterministic checks only. Claude verdict skipped per --dry-run flag."
+else
+  # ── Claude call ─────────────────────────────────────────────────────────────
+  PROMPT_FILE="$(mktemp /tmp/forge-verifier-prompt.XXXXXX)"
+  LOG_FILE="/tmp/forge-verifier-${NAME}-${TIMESTAMP}.log"
+  trap "rm -f $PROMPT_FILE" EXIT
+
+  # Gather artifacts for Claude context
+  SPEC_CONTENTS="$(cat "$SPEC_FILE")"
+  CLAUDE_MD_CONTENTS="$([[ -f "$CLAUDE_MD" ]] && cat "$CLAUDE_MD" || echo "(missing)")"
+  DOF_MD_CONTENTS="$([[ -f "$DOF_MD" ]] && cat "$DOF_MD" || echo "(missing)")"
+  COUNTER_CONTENTS="$([[ -f "$COUNTER_JSON" ]] && cat "$COUNTER_JSON" || echo "(missing)")"
+
+  cat "$FORGE_HOME/agents/forge/verifier/CLAUDE.md" > "$PROMPT_FILE"
+  cat >> "$PROMPT_FILE" <<VERIFIER_TASK
+
+---
+
+## TASK — Verify: $NAME
+
+Your role: ASSUME this scaffold is broken. Find the specific way it fails the spec or the DOF — do not confirm it looks complete. A structurally complete scaffold that declares false capabilities MUST fail. Judge DOF compliance and spec fidelity for the scaffolded agent "$NAME" from that posture.
+
+### Deterministic check results (already computed)
+${CHECKS_JSON}
+
+### Spec
+$SPEC_CONTENTS
+
+### agents/$NAME/CLAUDE.md
+$CLAUDE_MD_CONTENTS
+
+### agents/$NAME/dof.md
+$DOF_MD_CONTENTS
+
+### agents/$NAME/graduation_counter.json
+$COUNTER_CONTENTS
+
+### Instructions
+
+1. Read the spec, CLAUDE.md, and dof.md carefully.
+2. Judge DOF compliance: does the dof.md contain all 5 required sections (Hard Failures, Soft Failures, Not Failures, Monitoring, Last Reviewed)? Are the Hard Failures specific and named (not vague)?
+3. Judge spec fidelity: does the scaffolded CLAUDE.md match the spec's declared Lane, Trust Ladder start (L0), MCPs, Token tier, Cognitive tier, and 8-field Behavior Contract?
+4. Wallpaper check: does the CLAUDE.md declare output paths that actually exist? (Declared paths in Behavior Contract §8 Deployment — if they are runtime-created paths like output dirs, this is not a failure; if the file itself should have been scaffolded, check it.)
+5. Return your verdict as a single JSON object — no prose outside the JSON:
+
+{
+  "pass": true|false,
+  "claude_verdict": "<one sentence: PASS or FAIL + primary reason>",
+  "notes": "<2-5 specific findings — each finding names the exact section/field that passed or failed; no vague summaries>"
+}
+
+Hard rules:
+- If you return "pass": false, the notes MUST name the exact failed check by section/field.
+- Do NOT return "pass": true if declared outputs from the spec don't exist on disk at scaffold time (wallpaper pass).
+- Do NOT return "pass": true if the CLAUDE.md has no Trust Ladder section.
+- Do NOT return "pass": true if the dof.md is missing any of the 5 required sections.
+- Do NOT return "pass": false without a specific named reason — "verdict incomplete" is not acceptable.
+- Return ONLY the JSON object. No markdown fences, no preamble, no postamble.
+VERIFIER_TASK
+
+  log_action "verify_start $NAME"
+
+  CLAUDE_RAW="$("$CLAUDE_BIN" --model claude-sonnet-5 \
+    --permission-mode bypassPermissions \
+    --output-format text \
+    -p "$(cat "$PROMPT_FILE")" 2>"$LOG_FILE" || echo '{"pass":false,"claude_verdict":"error: Claude call failed","notes":"See log: '"$LOG_FILE"'"}')"
+
+  # Extract pass + verdict from Claude output (strip any accidental markdown fences)
+  CLAUDE_JSON="$(echo "$CLAUDE_RAW" | sed 's/^```json//; s/^```//; s/```$//' | tr -d '\r')"
+
+  CLAUDE_VERDICT_FIELD="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('claude_verdict',''))" 2>/dev/null || echo "error: parse failed")"
+  CLAUDE_PASS_FIELD="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print('true' if d.get('pass') else 'false')" 2>/dev/null || echo "false")"
+  NOTES="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('notes',''))" 2>/dev/null || echo "")"
+
+  CLAUDE_VERDICT="$CLAUDE_VERDICT_FIELD"
+
+  # If Claude says pass but deterministic checks failed — stay FAIL
+  if [[ "$CLAUDE_PASS_FIELD" == "false" ]]; then
+    OVERALL_PASS=false
+  fi
+fi
+
+# ── Write verdict JSON ────────────────────────────────────────────────────────
+PASS_STR="true"
+$OVERALL_PASS || PASS_STR="false"
+
+DRY_RUN_FALLBACK_STR="false"
+$DRY_RUN_FALLBACK && DRY_RUN_FALLBACK_STR="true"
+DRY_RUN_STR="false"
+$DRY_RUN && DRY_RUN_STR="true"
+
+# Escape strings for embedding in the Python heredoc
+CLAUDE_VERDICT_ESC="$(echo "$CLAUDE_VERDICT" | /usr/bin/python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
+NOTES_ESC="$(echo "$NOTES" | /usr/bin/python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
+
+/usr/bin/python3 - <<PYEOF
+import json
+# Embed booleans via JSON parse so True/False capitalisation is Python-correct
+pass_val   = json.loads("$PASS_STR")
+dry_run    = json.loads("$DRY_RUN_STR")
+fallback   = json.loads("$DRY_RUN_FALLBACK_STR")
+checks_raw = json.loads('[' + r"""$CHECKS_JSON""" + ']')
+verdict = {
+    "name": "$NAME",
+    "ts": "$NOW_ISO",
+    "pass": pass_val,
+    "dry_run": dry_run,
+    "dry_run_fallback": fallback,
+    "checks": checks_raw,
+    "claude_verdict": $CLAUDE_VERDICT_ESC,
+    "notes": $NOTES_ESC,
+}
+with open("$VERDICT_JSON", "w") as f:
+    json.dump(verdict, f, indent=2)
+print("verdict JSON written")
+PYEOF
+
+# ── Write human summary ───────────────────────────────────────────────────────
+PASS_LABEL="PASS"
+$OVERALL_PASS || PASS_LABEL="FAIL"
+
+# Pre-compute checks table (avoids nested heredoc issues)
+CHECKS_TABLE="$(echo "$CHECKS_JSON" | /usr/bin/python3 -c "
+import sys, json
+checks = json.loads('[' + sys.stdin.read() + ']')
+for c in checks:
+    icon = 'PASS' if c['pass'] else 'FAIL'
+    print(f\"- [{icon}] **{c['id']}**: {c['detail']}\")
+")"
+
+cat > "$SUMMARY_MD" <<SUMMARY_EOF
+---
+agent: $NAME
+ts: $NOW_ISO
+verdict: $PASS_LABEL
+dry_run: $DRY_RUN
+---
+
+# Forge Verifier — $PASS_LABEL: $NAME
+
+**Run:** $NOW_ISO
+**Dry-run:** $DRY_RUN
+
+## Deterministic Checks
+
+$CHECKS_TABLE
+
+## Claude Verdict
+
+$CLAUDE_VERDICT
+
+## Notes
+
+$NOTES
+
+---
+
+**Overall: $PASS_LABEL**
+Verdict JSON: $VERDICT_JSON
+SUMMARY_EOF
+
+# ── Audit + exit ──────────────────────────────────────────────────────────────
+log_action "verify_complete name=$NAME pass=$PASS_STR dry_run=$DRY_RUN verdict_json=$VERDICT_JSON"
+
+echo ""
+echo "forge-verifier: $PASS_LABEL — $NAME"
+echo "  Verdict JSON: $VERDICT_JSON"
+echo "  Summary:      $SUMMARY_MD"
+
+if $OVERALL_PASS; then
+  exit 0
+else
+  exit 30
+fi

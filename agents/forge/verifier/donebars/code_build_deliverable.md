@@ -1,0 +1,11 @@
+# Done-bar — code / build deliverable
+- [ ] Every file exists at its declared path
+- [ ] Python compiles; shell passes syntax check; JSON/YAML parses
+- [ ] The tool was RUN (dry-run or real) and produced real output — not just written
+- [ ] Output content is true against canonical sources, not wallpaper
+- [ ] No secrets, API keys, or direct Anthropic API calls in any file
+- [ ] Backup of every modified file exists in /tmp with a timestamp
+- [ ] Errors fail loudly: no bare except-and-continue on auth/network/rate-limit paths
+- [ ] Scheduled entry points survive restricted environments (absolute claude path, system python for Google libs, Phoenix timezone forced)
+- [ ] New agent scaffolds declare: trust level L0, credential pattern, power-down pattern, pre-check gate
+- [ ] A change-log comment is posted on the touched agent's card in your project tracker

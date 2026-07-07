@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# forge-specman — Fuzzy English idea → Diagnosis → operator confirm → validated spec + blind-spot Qs.
+#
+# v2 two-phase flow (U1):
+#   Phase 1: forge-specman "<fuzzy idea>"           → writes Diagnosis, exits 20.
+#   Phase 2: forge-specman --confirm-diagnosis <n>  → reads redlined Diagnosis, runs blind-spot pass.
+#
+# Usage:
+#   forge-specman "<fuzzy idea>"                         Phase 1 — Diagnosis draft
+#   forge-specman "<fuzzy idea>" --type=agent            Force type (agent|script|web-app|web-site)
+#   forge-specman "<fuzzy idea>" --dry-run               Write Phase 1 to /tmp/specman-<name>/
+#   forge-specman --confirm-diagnosis <name>             Phase 2 — run blind-spot pass
+#   forge-specman --help                                 Show usage
+#
+# Flags:
+#   --type=<agent|script|web-app|web-site>   Force type tag (inferred otherwise, Phase 1 only)
+#   --dry-run                                 Phase 1 only — write to /tmp/, skip queue
+#   --confirm-diagnosis <name>                Phase 2 — finalize spec after Diagnosis is redlined
+#
+# Paths:
+#   Output spec:   ~/.forge-suite/queue/forge/<name>_spec.md
+#   Summary:       ~/.forge-suite/outputs/forge/specman/<TS>_<name>_spec.md
+#   Blind-spot:    ~/.forge-suite/audit/blind-spots/<name>.log
+#   Diagnosis log: ~/.forge-suite/memory/diagnosis_patterns.md
+#   Journal:       ~/.forge-suite/journal/pending/specman_<TS>.md
+#
+# Exit codes:
+#   0   spec drafted (Phase 2), awaiting final approval
+#   1   fuzzy idea missing or invalid
+#   2   name collision with existing agent/bin
+#   3   circuit breaker tripped
+#   20  Diagnosis drafted (Phase 1), awaiting redline + --confirm-diagnosis
+#   21  --confirm-diagnosis called but Diagnosis placeholder not redlined
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+set -euo pipefail
+
+FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+QUEUE_DIR="$FORGE_HOME/queue/forge"
+OUTPUT_DIR="$FORGE_HOME/outputs/forge/specman"
+BLINDSPOT_DIR="$FORGE_HOME/audit/blind-spots"
+JOURNAL_DIR="$FORGE_HOME/journal/pending"
+AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+DIAGNOSIS_LOG="$FORGE_HOME/memory/diagnosis_patterns.md"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMESTAMP="$(date +%Y%m%d_%H%M)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$QUEUE_DIR" "$OUTPUT_DIR" "$BLINDSPOT_DIR" "$JOURNAL_DIR"
+
+die() { echo "forge-specman: $*" >&2; exit 1; }
+log_action() { echo "[$NOW_ISO] forge-specman $*" >> "$AUDIT_LOG"; }
+
+if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+  sed -n '1,35p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+# Branch: Phase 2 (confirm-diagnosis) vs Phase 1 (fuzzy idea)
+CONFIRM_MODE=false
+CONFIRM_NAME=""
+if [[ "${1:-}" == "--confirm-diagnosis" ]]; then
+  CONFIRM_MODE=true
+  shift
+  CONFIRM_NAME="${1:-}"
+  [[ -z "$CONFIRM_NAME" ]] && die "--confirm-diagnosis requires <name>"
+  [[ ! "$CONFIRM_NAME" =~ ^[a-z][a-z0-9-]+$ ]] && die "invalid kebab-case name: $CONFIRM_NAME"
+  shift
+fi
+
+FUZZY_IDEA=""
+TYPE=""
+DRY_RUN=false
+
+if ! $CONFIRM_MODE; then
+  FUZZY_IDEA="$1"
+  shift
+  [[ -z "$FUZZY_IDEA" ]] && die "fuzzy idea required as first arg"
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    --type=*)    TYPE="${arg#--type=}" ;;
+    --dry-run)   DRY_RUN=true ;;
+    *)           die "unknown flag: $arg" ;;
+  esac
+done
+
+# Circuit breaker preflight (pin /usr/bin/python3 so PyYAML resolves correctly
+# even when Homebrew python3 is earlier in PATH)
+if command -v forge-cb &>/dev/null; then
+  PYTHON_PATH_SAVE="$PATH"
+  export PATH="/usr/bin:/usr/local/bin:$PATH"
+  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
+  export PATH="$PYTHON_PATH_SAVE"
+fi
+
+PROMPT_FILE="$(mktemp /tmp/specman-prompt.XXXXXX)"
+LOG_FILE="/tmp/forge-specman-${TIMESTAMP}.log"
+trap "rm -f $PROMPT_FILE" EXIT
+
+# ========== PHASE 2: --confirm-diagnosis ==========
+if $CONFIRM_MODE; then
+  SPEC_FILE="$QUEUE_DIR/${CONFIRM_NAME}_spec.md"
+  [[ ! -f "$SPEC_FILE" ]] && die "spec not found: $SPEC_FILE — run Phase 1 (forge-specman <idea>) first"
+
+  if grep -q "<AWAITING CONFIRM OR REDIRECT>" "$SPEC_FILE"; then
+    echo "forge-specman: Diagnosis section still contains '<AWAITING CONFIRM OR REDIRECT>' placeholder." >&2
+    echo "Open $SPEC_FILE and redline the Diagnosis before running --confirm-diagnosis." >&2
+    log_action "confirm_refused_placeholder $CONFIRM_NAME"
+    exit 21
+  fi
+  if ! grep -qE "^## Diagnosis" "$SPEC_FILE"; then
+    die "spec $SPEC_FILE has no '## Diagnosis' section — re-run Phase 1"
+  fi
+
+  cat "$FORGE_HOME/agents/forge/specman/CLAUDE.md" > "$PROMPT_FILE"
+  cat >> "$PROMPT_FILE" <<SPECMAN_PHASE2
+
+---
+
+## TASK — Phase 2: Finalize spec with blind-spot pass
+
+You have confirmed the Diagnosis section of this spec: $SPEC_FILE
+
+Current spec content:
+$(cat "$SPEC_FILE")
+
+Required actions (execute in order using Edit/Write tools):
+
+1. **Preserve the Diagnosis section verbatim.** Your redlines are authoritative. Do not edit.
+2. **Use your confirmed Diagnosis as seed** for the rest of the spec. The "Alternative framings" and "What would have to be true for this NOT to be the right build" lines constrain scope and reveal edges — fold those into Hard/Soft failures and Blind-Spot questions.
+3. **Fill all 10 fields** (Agent/Build name, Lane, Cadence, Inputs, Outputs, Reporting line, MCPs, Token tier, **Cognitive tier**, Hard/Soft failures) + 8-field Behavior Contract + type-specific fields. Tag inferred fields with \`# inferred\`.
+
+   **Cognitive tier** (REQUIRED, since 2026-05-04 Wave 2): one of \`opus | sonnet | haiku | no-llm\` + one-sentence justification. Source of truth: $FORGE_HOME/config/model-routing.md.
+   - opus = voice / multi-step reasoning / strategic synthesis
+   - sonnet = formatting / light synthesis the operator reviews
+   - haiku = classification / sync / health check / synthesis the operator does NOT read
+   - no-llm = pure shell/Node/Python; never spawns \`claude\`
+   - **Verification: bin-level audit confirms tier assignment matches actual claude invocation pattern. Schedule frequency ≠ LLM call frequency.** A plist that fires every 30 min is not a high-cost agent if its bin is shell-first and only calls claude on specific triggers. Before assigning \`haiku\` for cost-savings reasons, read the bin and confirm: (a) it actually invokes claude, and (b) how often per fire. A prior audit wave caught several bins that didn't invoke claude at all.
+   - **Off-manifest agents (those invoked downstream of a plist rather than scheduled directly) must be declared in their parent plist's spec under a \`Spawns\` field.** A plist's bin that orchestrates (e.g. a pipeline bin calling a triage agent then a drafting agent) must enumerate every child it invokes, the child's bin path, and the child's cognitive tier. Manifest tracking requires plist + spawned-children visibility so every claude invocation site shows up in \`~/.forge-suite/config/model-routing.md\` (per-agent table OR the Off-manifest section). This requirement was introduced after an audit found an off-manifest orchestrator agent racking up the single largest model-cost drain, untracked.
+   - **Runtime verification required.** Read a log line from a real launchd-fired run confirming the actual model invoked. Bin code review (Bin-verified) is necessary but not sufficient — bins that source config files (\`.env\`, etc.) can have silently overridden launchd env vars. Mark \`Runtime-verified=yes\` only after reading a log entry from a real fire. Reference incident: a legacy triage agent shipped an env-var-aware patch; the first real fire showed the wrong model invoked because \`.env\` was sourced post-launchd-env and clobbered the plist value. See \`model-routing.md\` Env-var precedence section + Rollout history.
+4. **Run 5-pass blind-spot protocol.** 2–5 total questions across: edge cases, 10X adjacencies, failure-mode gaps, UX/second-order, ecosystem fit. Must be SPECIFIC to this build. Include in \`## Blind-Spot Questions (SpecMan's 5-pass)\` section.
+5. **Seed blind-spot log** at $BLINDSPOT_DIR/${CONFIRM_NAME}.log — one line per question in canonical format:
+   \`[<ISO>] ${CONFIRM_NAME} question_NN "<question>" answered "<awaiting>" gap=null skip_clean=null\`
+   MANDATORY. Bin-level fallback will synthesize if missing, but the subprocess should do it directly.
+6. **Write summary** to $OUTPUT_DIR/${TIMESTAMP}_${CONFIRM_NAME}_spec.md — path to spec + blind-spot Q count + final line "AWAITING APPROVAL".
+7. **Write journal** to $JOURNAL_DIR/specman_${TIMESTAMP}.md — name, phase=2, outputs produced, blind-spot Q count.
+
+Reference patterns:
+- 9-field spec + 8-field Behavior Contract: $FORGE_HOME/agents/_shared/AGENT_BEHAVIOR_CONTRACT.md
+- Silence rule: $FORGE_HOME/agents/_shared/silence_rule.md
+- Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
+- Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
+- Prior SpecMan lessons: $FORGE_HOME/memory/lessons/specman_lessons.md
+- Blind-spot patterns (v2 U5 signal, may be empty): $FORGE_HOME/memory/blind_spot_patterns.md
+
+Hard constraints:
+- Do NOT overwrite the \`## Diagnosis\` section — it's already been redlined.
+- Spec MUST include \`## Blind-Spot Questions\` section with 2–5 questions.
+- No ANTHROPIC_API_KEY in any generated content.
+- Never write to $FORGE_HOME/agents/${CONFIRM_NAME}/ (Builder's exclusive zone).
+SPECMAN_PHASE2
+
+  log_action "confirm_diagnosis_start $CONFIRM_NAME"
+  RUN_START_EPOCH="$(date +%s)"
+  export RUN_START_EPOCH FORGE_HOME
+
+  "$CLAUDE_BIN" --model claude-sonnet-5 \
+    --permission-mode bypassPermissions \
+    --output-format text \
+    -p "$(cat "$PROMPT_FILE")" \
+    > /dev/null 2>"$LOG_FILE" || {
+    log_action "confirm_error $CONFIRM_NAME see_log=$LOG_FILE"
+    echo "forge-specman: Phase 2 Claude run failed. See log: $LOG_FILE" >&2
+    exit 1
+  }
+
+  # Post-run fallback: seed blind-spot log if subprocess skipped it.
+  PATH_SAVE="$PATH"
+  export PATH="/usr/bin:/usr/local/bin:$PATH"
+  /usr/bin/python3 - <<'PYEOF' || true
+import os, re, time, sys
+from pathlib import Path
+
+home = Path(os.environ.get("FORGE_HOME", str(Path.home() / ".forge-suite")))
+queue_dir = home / "queue" / "forge"
+log_dir = home / "audit" / "blind-spots"
+log_dir.mkdir(parents=True, exist_ok=True)
+run_start = float(os.environ.get("RUN_START_EPOCH", "0"))
+
+for spec_path in queue_dir.glob("*_spec.md"):
+    if spec_path.stat().st_mtime < run_start - 1:
+        continue
+    name = spec_path.stem.replace("_spec", "")
+    log_path = log_dir / f"{name}.log"
+    if log_path.exists() and log_path.stat().st_size > 0:
+        continue
+    text = spec_path.read_text()
+    m = re.search(r"^##\s*Blind-Spot Questions.*?$(.*?)(?=^##\s|\Z)", text, re.M | re.S)
+    if not m:
+        continue
+    section = m.group(1)
+    questions = re.findall(
+        r"^\s*\d+\.\s*(?:\*\*([^:]+?):\*\*)?\s*(.+?)(?=^\s*\d+\.|\Z)",
+        section, re.M | re.S,
+    )
+    if not questions:
+        continue
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    out = [
+        f"# Blind-spot Q&A log for {name}",
+        "# Format: [ISO] <agent> question_NN \"<question>\" answered \"<answer>\" gap=<bool> skip_clean=<bool>",
+        "# Seeded by forge-specman bin fallback.",
+        "#",
+    ]
+    for i, (label, body) in enumerate(questions, 1):
+        q = ((label + ": ") if label else "") + body.strip()
+        q = re.sub(r"\s+", " ", q).replace('"', "'")[:400]
+        out.append(
+            f'[{iso}] {name} question_{i:02d} "{q}" answered "<awaiting>" gap=null skip_clean=null'
+        )
+    log_path.write_text("\n".join(out) + "\n")
+    print(f"forge-specman: fallback-seeded blind-spot log for {name} ({len(questions)} Qs)", file=sys.stderr)
+PYEOF
+  export PATH="$PATH_SAVE"
+
+  # Append diagnosis_confirmed event to diagnosis_patterns.md
+  if [[ -f "$DIAGNOSIS_LOG" ]]; then
+    DIAG_EXCERPT=$(/usr/bin/awk '/^## Diagnosis/,/^## (Cadence|Blind-Spot|Behavior|Hard failures)/' "$SPEC_FILE" \
+      | /usr/bin/sed 's/|/\\|/g' | /usr/bin/tr '\n' ' ' | /usr/bin/head -c 200)
+    echo "| $NOW_ISO | $CONFIRM_NAME | diagnosis_confirmed | (see spec) | ${DIAG_EXCERPT}... | pending | operator-confirmed; awaiting build |" >> "$DIAGNOSIS_LOG"
+  fi
+
+  log_action "confirm_diagnosis_complete $CONFIRM_NAME awaiting_approval"
+
+  echo ""
+  echo "forge-specman: Phase 2 complete — spec finalized at:"
+  echo "  $SPEC_FILE"
+  echo ""
+  echo "Next: review Blind-Spot Questions, answer inline (or write 'skip — build as-is'),"
+  echo "then run: forge-builder $CONFIRM_NAME"
+  exit 0
+fi
+
+# ========== PHASE 1: Diagnosis draft ==========
+
+# U4 — Skill Discovery: build existing-capabilities inventory so the LLM can
+# detect overlaps during Diagnosis ("cheaper/existing-thing-overlooked" check).
+# Pure plumbing — no new sections, no output changes, just richer LLM context.
+EXISTING_BINS=$(ls "$FORGE_HOME/bin/" 2>/dev/null | grep -v '\.bak\|\.example' | sort | tr '\n' ' ')
+EXISTING_AGENTS=$(ls "$FORGE_HOME/agents/" 2>/dev/null | grep -v '^_' | sort | tr '\n' ' ')
+INSTALLED_SKILLS=$(ls "$HOME/.claude/skills/" 2>/dev/null | sort | tr '\n' ' ' || echo "(none)")
+
+cat "$FORGE_HOME/agents/forge/specman/CLAUDE.md" > "$PROMPT_FILE"
+cat >> "$PROMPT_FILE" <<SPECMAN_PHASE1
+
+---
+
+## TASK — Phase 1: Diagnosis pass
+
+Fuzzy idea (from you):
+"""
+$FUZZY_IDEA
+"""
+
+Type hint: ${TYPE:-<infer from idea>}
+Dry run: $DRY_RUN
+Target spec file: ${DRY_RUN:+/tmp/specman-<name>/<name>_spec.md or }$QUEUE_DIR/<name>_spec.md
+
+Required actions (execute in order using Write tool):
+
+1. **Parse the fuzzy idea.** Extract target name (kebab-case), type (agent/script/web-app/web-site), one-sentence lane.
+2. **Collision check.** Refuse if $FORGE_HOME/agents/<name>/ OR $HOME/.forge-suite/bin/<name> exists. Write gap note + stop (exit via die, not spec).
+3. **Demotion check.** Read $FORGE_HOME/memory/demoted_patterns.md. If idea invokes a demoted pattern, refuse (the operator did not pass --override-demotion).
+4. **Write DIAGNOSIS-ONLY spec skeleton.** This is v2 U1 — Phase 1 stops after Diagnosis. Fill ONLY:
+   - YAML frontmatter (type, name, status: draft, generated_by, generated, phase: diagnosis)
+   - \`## Agent name\` / \`## Build name\` (kebab-case)
+   - \`## Lane\` (one sentence)
+   - \`## Diagnosis\` section with four subsections (see template below)
+   - Placeholder \`## Awaiting Phase 2 — Blind-Spot Questions\` (literal string, replaced when --confirm-diagnosis runs)
+
+   Diagnosis template (fill all four subsections):
+   \`\`\`
+   ## Diagnosis
+
+   ### Restate (your words)
+   > <one paragraph mirroring your fuzzy input verbatim, in blockquote — don't paraphrase; copy your phrasing>
+
+   ### Alternative framings
+   1. <first alternative framing of the same problem — a different agent/tool/scope that would solve the same pain>
+   2. <second alternative framing — orthogonal angle, not just a rewording>
+
+   ### What would have to be true for this NOT to be the right build
+   - <condition 1 — what assumption about the problem is this build making?>
+   - <condition 2 — what cheaper/existing thing is being overlooked?>
+   - <condition 3 — what scope boundary would make this the wrong tool?>
+
+   ### Confirmation
+   <AWAITING CONFIRM OR REDIRECT>
+   \`\`\`
+
+5. **DO NOT** fill Cadence, Inputs, Outputs, Reporting line, MCPs, Token tier, Cognitive tier, Hard/Soft failures, Behavior Contract, or Blind-Spot Questions. Those come in Phase 2.
+6. **DO NOT** seed the blind-spot log in Phase 1 — Phase 2 owns that.
+7. **Write summary** to $OUTPUT_DIR/${TIMESTAMP}_<name>_spec_diagnosis.md listing name, type, and final line "AWAITING DIAGNOSIS CONFIRM".
+8. **Write journal** to $JOURNAL_DIR/specman_${TIMESTAMP}.md — fuzzy idea input, phase=1, name produced.
+9. **Write name marker** to /tmp/forge-specman-last-name so the bin can surface it to you: \`echo "<name>" > /tmp/forge-specman-last-name\`
+
+Reference patterns:
+- 9-field spec + 8-field Behavior Contract: $FORGE_HOME/agents/_shared/AGENT_BEHAVIOR_CONTRACT.md
+- Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
+- Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
+- Diagnosis examples: $FORGE_HOME/memory/diagnosis_patterns.md (may be empty — v2 U1 just launched)
+
+Existing capabilities inventory (v2 U4 — Skill Discovery):
+Use this list when writing the "What would have to be true for this NOT to be the right build" bullets.
+If the fuzzy idea overlaps with an existing bin or agent, name it specifically in the overlap bullet.
+
+Existing bins (~/.forge-suite/bin/):
+$EXISTING_BINS
+
+Existing agents (~/.forge-suite/agents/):
+$EXISTING_AGENTS
+
+Installed Claude skills (~/.claude/skills/):
+$INSTALLED_SKILLS
+
+Hard constraints:
+- Diagnosis MUST have all 4 subsections filled (Restate, Alternative framings (≥2), What would have to be true (≥3 bullets), Confirmation placeholder).
+- Alternative framings must be GENUINELY different angles, not reworded.
+- "What would have to be true" must include cheaper/existing-thing-overlooked check.
+- No ANTHROPIC_API_KEY in any generated content.
+- Never write to $FORGE_HOME/agents/<name>/ (Builder's exclusive zone).
+- Never activate, launch, or register anything.
+SPECMAN_PHASE1
+
+log_action "diagnosis_start fuzzy_idea_hash=$(echo -n "$FUZZY_IDEA" | md5 -q 2>/dev/null || echo -n "$FUZZY_IDEA" | md5sum | cut -d' ' -f1)"
+RUN_START_EPOCH="$(date +%s)"
+export RUN_START_EPOCH FORGE_HOME
+
+rm -f /tmp/forge-specman-last-name
+
+"$CLAUDE_BIN" --model claude-sonnet-5 \
+  --permission-mode bypassPermissions \
+  --output-format text \
+  -p "$(cat "$PROMPT_FILE")" \
+  > /dev/null 2>"$LOG_FILE" || {
+  log_action "diagnosis_error see_log=$LOG_FILE"
+  echo "forge-specman: Phase 1 Claude run failed. See log: $LOG_FILE" >&2
+  exit 1
+}
+
+LAST_NAME=""
+[[ -f /tmp/forge-specman-last-name ]] && LAST_NAME="$(cat /tmp/forge-specman-last-name)"
+
+log_action "diagnosis_drafted name=${LAST_NAME:-unknown} awaiting_confirm"
+
+echo ""
+echo "forge-specman: Phase 1 complete — Diagnosis drafted."
+echo ""
+if [[ -n "$LAST_NAME" ]]; then
+  echo "  Spec: $QUEUE_DIR/${LAST_NAME}_spec.md"
+  echo ""
+  echo "Next:"
+  echo "  1. Open the spec and redline the \`## Diagnosis\` section (replace '<AWAITING CONFIRM OR REDIRECT>')."
+  echo "  2. Run: forge-specman --confirm-diagnosis $LAST_NAME"
+else
+  echo "  Spec: $QUEUE_DIR/*_spec.md (most recent)"
+  echo ""
+  echo "Next: open the spec, redline the Diagnosis section, then run forge-specman --confirm-diagnosis <name>."
+fi
+
+exit 20

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# forge-learn — Daily self-review orchestrator for Forge sub-agents.
+# Runs at 2am via launchd. Each sub-agent self-reviews its day's output,
+# ingests findings from the monitoring agent, appends to its lessons file,
+# and writes a digest to journal/pending.
+#
+# Usage:
+#   forge-learn specman|builder|designer|all    Run learning loop for sub-agent(s)
+#   forge-learn --dry-run all                   Print what would happen, no writes
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+import sys
+import os
+import subprocess
+import datetime
+import pathlib
+import json
+import concurrent.futures
+
+FORGE_HOME = pathlib.Path(os.environ.get("FORGE_HOME", pathlib.Path.home() / ".forge-suite"))
+LESSONS_DIR = FORGE_HOME / "memory" / "lessons"
+OUTPUTS_DIR = FORGE_HOME / "outputs" / "forge"
+JOURNAL_DIR = FORGE_HOME / "journal" / "pending"
+AUDIT_LOG = FORGE_HOME / "audit" / "actions.log"
+MONITOR_LOG_DIR = FORGE_HOME / "outputs" / "monitor"
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", str(pathlib.Path.home() / ".local/bin/claude"))
+TODAY = datetime.date.today().isoformat()
+NOW = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+DRY_RUN = "--dry-run" in sys.argv
+
+# Time Machine dedup (Phase 6, 2026-05-02): plist now fires hourly +
+# at boot. Skip the daily learning loop if a successful run happened in the
+# last 18h. Honor --dry-run as an explicit override.
+if not DRY_RUN:
+    try:
+        _r = subprocess.run(
+            ["python3", str(pathlib.Path.home() / ".forge-suite/lib/forge_resume.py"),
+             "check", "forge-learn", "18"],
+            capture_output=True, check=False,
+        )
+        if _r.returncode == 0:
+            sys.exit(0)
+    except Exception:
+        pass
+
+SUBAGENTS = ["specman", "builder", "designer"]
+
+CB_LIMIT_INPUT = 20000   # per sub-agent per day
+CB_LIMIT_OUTPUT = 5000
+
+def log(msg: str):
+    line = f"[{NOW}] forge-learn {msg}"
+    with open(AUDIT_LOG, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+def check_cb() -> bool:
+    result = subprocess.run(["forge-cb", "check", "forge"], capture_output=True)
+    return result.returncode == 0
+
+def get_day_outputs(subagent: str) -> list[pathlib.Path]:
+    out_dir = OUTPUTS_DIR / subagent
+    if not out_dir.exists():
+        return []
+    prefix = TODAY.replace("-", "")
+    return sorted(out_dir.glob(f"{prefix}*"))
+
+def get_monitor_findings() -> str:
+    # The monitoring agent writes daily summaries as outputs/monitor/{YYYYMMDD}_summary.md
+    # (date without dashes, e.g. 20260610_summary.md).
+    today_nodash = TODAY.replace("-", "")
+    monitor_today = MONITOR_LOG_DIR / f"{today_nodash}_summary.md"
+    if monitor_today.exists():
+        content = monitor_today.read_text(encoding="utf-8")
+        return content[:3000]  # trim for context budget
+    # Fallback: look for any monitor summary from the last 2 days
+    for days_back in range(1, 3):
+        past = datetime.date.today() - datetime.timedelta(days=days_back)
+        past_nodash = past.isoformat().replace("-", "")
+        fallback = MONITOR_LOG_DIR / f"{past_nodash}_summary.md"
+        if fallback.exists():
+            content = fallback.read_text(encoding="utf-8")
+            return f"(from {past.isoformat()}) " + content[:3000]
+    return "(no monitoring findings today)"
+
+def learn_subagent(subagent: str) -> bool:
+    lessons_file = LESSONS_DIR / f"{subagent}_lessons.md"
+    agent_claude_md = FORGE_HOME / "agents" / "forge" / subagent / "CLAUDE.md"
+    day_outputs = get_day_outputs(subagent)
+    monitor_findings = get_monitor_findings()
+
+    if not lessons_file.exists():
+        log(f"warn lessons_file_missing {subagent}")
+        lessons_file.parent.mkdir(parents=True, exist_ok=True)
+        lessons_file.write_text(f"# {subagent.title()} Lessons\n\n*Auto-created by forge-learn.*\n")
+
+    # Idle gate: if no outputs modified in the last 24h, skip the Claude call.
+    # "Still dormant" lessons burn tokens with zero signal.
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+    recent_outputs = [
+        p for p in (OUTPUTS_DIR / subagent).glob("*")
+        if p.is_file() and datetime.datetime.fromtimestamp(p.stat().st_mtime) >= cutoff
+    ] if (OUTPUTS_DIR / subagent).exists() else []
+
+    if not recent_outputs:
+        skip_line = f"{TODAY} | no activity — skipped (idle gate)\n"
+        if not DRY_RUN:
+            with open(lessons_file, "a") as lf:
+                lf.write(skip_line)
+            log(f"learn_idle_skip {subagent}")
+        else:
+            print(f"[DRY RUN] idle gate: no recent outputs for {subagent} — would skip Claude call")
+        return True
+
+    outputs_summary = "\n".join([str(p.name) for p in day_outputs]) or "(no outputs today)"
+
+    prompt = f"""You are the self-review loop for forge-{subagent}, a sub-agent under the Commander's Forge pipeline.
+
+Agent CLAUDE.md:
+{agent_claude_md.read_text() if agent_claude_md.exists() else "(not found)"}
+
+Today's date: {TODAY}
+
+Today's output files ({len(day_outputs)} total):
+{outputs_summary}
+
+Monitoring-agent audit findings (last 24h, truncated):
+{monitor_findings}
+
+Lessons file path: {lessons_file}
+
+Instructions:
+1. Review today's outputs against the agent's DOF. Score each as CLEAN or SOFT_FAIL or HARD_FAIL.
+2. Identify any behavior patterns from today's runs that should change tomorrow.
+3. Write a single lesson entry (not more than 5 lines) in this exact format:
+   {TODAY} | <what happened or "(no outputs)"> | <what we learned> | <how behavior changes>
+4. Append that entry to the lessons file at {lessons_file}.
+5. Write a one-line digest to {JOURNAL_DIR}/forge_daily_{TODAY}.md (append if exists):
+   forge-learn {subagent}: <one sentence summary>
+
+Hard constraints:
+- No ANTHROPIC_API_KEY anywhere.
+- Max 20K input / 5K output for this run.
+- If there were no outputs today, still write the lessons entry noting "no outputs".
+- Do not modify any agent CLAUDE.md or DOF files.
+"""
+
+    if DRY_RUN:
+        print(f"[DRY RUN] would invoke Claude for forge-learn {subagent}")
+        print(f"  outputs today: {len(day_outputs)}")
+        print(f"  lessons file: {lessons_file}")
+        return True
+
+    log(f"learn_start {subagent}")
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "--model", "claude-haiku-4-5-20251001",
+             "--permission-mode", "acceptEdits",
+             "--output-format", "text",
+             "-p", prompt],
+            capture_output=True, text=True, timeout=180
+        )
+        if result.returncode != 0:
+            log(f"learn_error {subagent} claude_exit={result.returncode}")
+            return False
+        log(f"learn_complete {subagent}")
+        return True
+    except subprocess.TimeoutExpired:
+        log(f"learn_timeout {subagent}")
+        return False
+    except Exception as e:
+        log(f"learn_exception {subagent} {e}")
+        return False
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
+        print("Usage: forge-learn specman|builder|designer|all [--dry-run]")
+        sys.exit(1)
+
+    targets = SUBAGENTS if args[0] == "all" else [args[0]]
+    for t in targets:
+        if t not in SUBAGENTS:
+            print(f"forge-learn: unknown sub-agent '{t}'. Valid: {', '.join(SUBAGENTS)}, all")
+            sys.exit(1)
+
+    if not DRY_RUN and not check_cb():
+        log("circuit_breaker_tripped")
+        sys.exit(3)
+
+    # U7 — Async Grading: run all sub-agent learning loops in parallel.
+    # Same behavior as sequential, same outputs, same audit log entries — just faster.
+    # ThreadPoolExecutor is safe here: each learn_subagent() call writes to a
+    # separate lessons file and separate journal path with no shared state.
+    results = {}
+    if len(targets) == 1:
+        # Single target: no parallelism needed, run directly.
+        results[targets[0]] = learn_subagent(targets[0])
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            futures = {executor.submit(learn_subagent, t): t for t in targets}
+            for future in concurrent.futures.as_completed(futures):
+                subagent = futures[future]
+                try:
+                    results[subagent] = future.result()
+                except Exception as exc:
+                    log(f"learn_exception_async {subagent} {exc}")
+                    results[subagent] = False
+
+    all_ok = all(results.values())
+    log(f"run_complete results={json.dumps(results)}")
+    if all_ok:
+        try:
+            subprocess.run(
+                ["python3", str(pathlib.Path.home() / ".forge-suite/lib/forge_resume.py"),
+                 "record-success", "forge-learn"],
+                capture_output=True, check=False,
+            )
+        except Exception:
+            pass
+    sys.exit(0 if all_ok else 1)
+
+
+if __name__ == "__main__":
+    main()

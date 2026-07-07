@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# forge-builder — Read approved spec → scaffold every artifact → one commit.
+#
+# Usage:
+#   forge-builder <name>                     Scaffold from spec at ~/.forge-suite/queue/forge/<name>_spec.md
+#   forge-builder <name> --dry-run           Write to /tmp/forge-builder-<name>/
+#   forge-builder --help                     Show usage
+#
+# Paths:
+#   Spec (reads):     ~/.forge-suite/queue/forge/<name>_spec.md
+#   Scaffold target:  ~/.forge-suite/agents/<name>/  (for type=agent) OR project path
+#   Bin:              ~/.forge-suite/bin/<name>
+#   Summary:          ~/.forge-suite/outputs/forge/builder/<TS>_<name>_scaffold.md
+#   Graduation:       ~/.forge-suite/state/forge/graduation_counter.json
+#   Lessons seed:     ~/.forge-suite/memory/lessons/<name>_lessons.md
+#
+# Exit codes:
+#   0  scaffold complete, committed, awaiting activation
+#   1  spec invalid or missing required fields
+#   2  name collision
+#   3  circuit breaker tripped
+#   4  commit failed
+#   5  Designer invocation failed for web build
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+set -euo pipefail
+
+FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+QUEUE_DIR="$FORGE_HOME/queue/forge"
+OUTPUT_DIR="$FORGE_HOME/outputs/forge/builder"
+STATE_DIR="$FORGE_HOME/state/forge"
+LESSONS_DIR="$FORGE_HOME/memory/lessons"
+JOURNAL_DIR="$FORGE_HOME/journal/pending"
+AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMESTAMP="$(date +%Y%m%d_%H%M)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$OUTPUT_DIR" "$STATE_DIR" "$LESSONS_DIR" "$JOURNAL_DIR"
+
+die() { echo "forge-builder: $*" >&2; exit 1; }
+log_action() { echo "[$NOW_ISO] forge-builder $*" >> "$AUDIT_LOG"; }
+
+if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+  sed -n '1,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+NAME="$1"
+shift
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    *)         die "unknown flag: $arg" ;;
+  esac
+done
+
+# Validate name
+[[ ! "$NAME" =~ ^[a-z][a-z0-9-]+$ ]] && die "invalid kebab-case name: $NAME"
+
+SPEC_FILE="$QUEUE_DIR/${NAME}_spec.md"
+[[ ! -f "$SPEC_FILE" ]] && die "spec not found: $SPEC_FILE. Run forge-specman first."
+
+# Collision check
+if [[ -d "$FORGE_HOME/agents/$NAME" ]]; then
+  log_action "collision agent_dir $NAME"
+  die "agent dir already exists: $FORGE_HOME/agents/$NAME"
+fi
+if [[ -f "$FORGE_HOME/bin/$NAME" ]]; then
+  log_action "collision bin $NAME"
+  die "bin script already exists: $FORGE_HOME/bin/$NAME"
+fi
+
+# Validate spec has required sections
+for section in "^## (Agent name|Build name)" "^## Lane" "^## Diagnosis" "^## Behavior Contract" "^## Blind-Spot Questions"; do
+  if ! grep -qE "$section" "$SPEC_FILE"; then
+    log_action "spec_invalid_missing_section $NAME section=$section"
+    die "spec missing section matching: $section"
+  fi
+done
+
+# v2 U1: refuse to scaffold if Diagnosis still has placeholder
+if grep -q "<AWAITING CONFIRM OR REDIRECT>" "$SPEC_FILE"; then
+  log_action "spec_invalid_unredlined_diagnosis $NAME"
+  die "Diagnosis section still contains '<AWAITING CONFIRM OR REDIRECT>' placeholder. Redline + run forge-specman --confirm-diagnosis $NAME first."
+fi
+
+# Circuit breaker preflight (pin /usr/bin/python3 so PyYAML resolves correctly
+# even when Homebrew python3 is earlier in PATH)
+if command -v forge-cb &>/dev/null; then
+  PYTHON_PATH_SAVE="$PATH"
+  export PATH="/usr/bin:/usr/local/bin:$PATH"
+  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
+  export PATH="$PYTHON_PATH_SAVE"
+fi
+
+# Read type from frontmatter
+SPEC_TYPE=$(awk '/^type:/ {print $2; exit}' "$SPEC_FILE" 2>/dev/null || echo "agent")
+[[ -z "$SPEC_TYPE" ]] && SPEC_TYPE="agent"
+
+log_action "build_start $NAME type=$SPEC_TYPE spec_hash=$(md5 -q "$SPEC_FILE" 2>/dev/null || md5sum "$SPEC_FILE" | cut -d' ' -f1)"
+
+SUMMARY_FILE="$OUTPUT_DIR/${TIMESTAMP}_${NAME}_scaffold.md"
+ACTIVATION_MEMO_FILE="$OUTPUT_DIR/${TIMESTAMP}_${NAME}_activation_memo.md"
+PROMPT_FILE="$(mktemp /tmp/forge-builder-prompt.XXXXXX)"
+LOG_FILE="/tmp/forge-builder-${NAME}-${TIMESTAMP}.log"
+trap "rm -f $PROMPT_FILE" EXIT
+
+if $DRY_RUN; then
+  TARGET_DIR="/tmp/forge-builder-$NAME"
+  mkdir -p "$TARGET_DIR"
+  echo "forge-builder: DRY RUN → $TARGET_DIR"
+else
+  TARGET_DIR="$FORGE_HOME/agents/$NAME"
+  mkdir -p "$TARGET_DIR/state"
+fi
+
+# Designer pass (web builds only)
+if [[ "$SPEC_TYPE" == "web-app" || "$SPEC_TYPE" == "web-site" ]]; then
+  if [[ ! -f "$HOME/.claude/skills/frontend-design/SKILL.md" ]]; then
+    echo "forge-builder: \`frontend-design\` skill not installed. Install via:"
+    echo "  forge-skill-install https://github.com/anthropics/skills/tree/main/skills/frontend-design"
+    log_action "build_blocked $NAME skill_missing=frontend-design"
+    exit 5
+  fi
+  echo "forge-builder: invoking Designer for $SPEC_TYPE build..."
+  if ! forge-designer "$NAME" ${DRY_RUN:+--dry-run}; then
+    log_action "build_soft_fail $NAME designer_failed"
+    echo "forge-builder: Designer failed. Flagging for follow-up; continuing scaffold." >&2
+  fi
+fi
+
+# Build prompt
+# Step 10 must be a real conditional: DRY_RUN is always the non-empty string
+# "true" or "false", so ${DRY_RUN:+..}${DRY_RUN:-..} emitted BOTH branches
+# mangled and the commit instruction never reached the subprocess.
+if [[ "$DRY_RUN" == "true" ]]; then
+  STEP10="Skip step 10 (dry-run)."
+else
+  STEP10="10. Commit: cd $FORGE_HOME && git add agents/$NAME/ bin/$NAME config/token_limits.yaml state/forge/graduation_counter.json memory/lessons/${NAME}_lessons.md journal/pending/${NAME}_${TIMESTAMP}.md && git commit -m \"forge-builder: scaffold $NAME (L0)\""
+fi
+cat "$FORGE_HOME/agents/forge/builder/CLAUDE.md" > "$PROMPT_FILE"
+cat >> "$PROMPT_FILE" <<BUILDER_TASK
+
+---
+
+## TASK — Scaffold: $NAME (type=$SPEC_TYPE)
+
+Spec file: $SPEC_FILE
+Target dir: $TARGET_DIR
+Bin script: $HOME/.forge-suite/bin/$NAME
+Summary file: $SUMMARY_FILE
+Timestamp: $TIMESTAMP
+Dry run: $DRY_RUN
+
+Spec contents:
+$(cat "$SPEC_FILE")
+
+Required actions (execute in order using Write/Edit/Bash):
+
+1. Write $TARGET_DIR/dof.md — Hard Failures (≥3), Soft Failures (≥2), Not Failures, Monitoring, Last Reviewed.
+2. Write $TARGET_DIR/CLAUDE.md — Identity, Lane, Trust Ladder (starts L0), Circuit Breaker, DOF Reference, VOICE_PROFILE ref, Output paths, Session End instructions, Silence Contract ref ($FORGE_HOME/agents/_shared/silence_rule.md), full 8-field Behavior Contract mirroring the spec.
+3. Write $HOME/.forge-suite/bin/$NAME — proper usage header, flags, paths, exit codes, auth note (NO ANTHROPIC_API_KEY — Claude Code subscription only), forge-cb preflight, forge-state-update at end. chmod +x after write.
+4. Append entry to $FORGE_HOME/config/token_limits.yaml under \`agents.$NAME:\` with the declared token tier.
+5. Update $FORGE_HOME/state/forge/graduation_counter.json — add \`"$NAME": {"trust_level": "L0", "zero_edit_approvals": 0, "last_updated": "$NOW_ISO"}\` under \`agents\`.
+6. Seed $FORGE_HOME/memory/lessons/${NAME}_lessons.md with the standard lessons-file frontmatter + seed entry.
+7. Write $FORGE_HOME/journal/pending/${NAME}_${TIMESTAMP}.md — placeholder for first-run journal.
+8. Write $SUMMARY_FILE — list of all files created, 9-field + 8-field checklist (each OK/MISSING), blind-spot Q&A count, final line "AWAITING APPROVAL".
+
+9. (v2 U2) Write $ACTIVATION_MEMO_FILE — MANDATORY payoff/cost/risk memo the operator reads before activating. Template:
+
+   \`\`\`markdown
+   ---
+   agent: $NAME
+   built: $TIMESTAMP
+   status: PENDING ACTIVATION
+   ---
+
+   ## Payoff
+   - Hours saved per week: <estimate from spec lane + cadence; if spec doesn't say, infer conservatively and tag \`# inferred\`>
+   - Payoff window: <weeks until hours-saved exceed this build's build-hours (rough build-hours = 0.5 for standard agent, 2 for web-app)>
+
+   ## Cost
+   - Estimated tokens per month: <cadence × (input + output) from spec's token tier row × 30>
+   - Monthly USD at Sonnet rates (ref only): ~\$<tokens/1M × 3 input + tokens/1M × 15 output, rounded>
+
+   ## Dependencies
+   - Upstream agents/data: <list from spec's Inputs section>
+   - Skills required: <list from spec's MCPs required + any explicit skill mentions>
+
+   ## Risk if underperforms
+   - <top 3 specific risks derived from spec's Hard failures>
+
+   ## Kill criteria
+   - <specific measurable conditions that would trigger demotion or removal — typically: soft-failure count > N in 30 days; output quality drops below X; escalation Y times>
+
+   ## Scoreboard reference
+   - ~/.forge-suite/entities/scoreboard.md (read-only, memo does not update)
+
+   ## ACTIVATION
+   To activate: run \`$NAME\` from any terminal. No automatic activation on scaffold-complete.
+   \`\`\`
+
+   Fill every field from the spec. Tag any field you had to infer with \`# inferred\`. Do not leave TODO placeholders. A bin-level fallback will synthesize a minimal memo if missing — but subprocess should produce the real one.
+
+$STEP10
+
+Hard constraints:
+- Generated bin script must NOT contain ANTHROPIC_API_KEY or direct anthropic.Anthropic() calls.
+- New agent starts at L0.
+- No activation, no launchd load.
+- Scaffold lives only at $TARGET_DIR and $HOME/.forge-suite/bin/$NAME.
+BUILDER_TASK
+
+"$CLAUDE_BIN" --model claude-sonnet-5 \
+  --permission-mode bypassPermissions \
+  --output-format text \
+  -p "$(cat "$PROMPT_FILE")" \
+  > /dev/null 2>"$LOG_FILE" || {
+  log_action "build_error $NAME see_log=$LOG_FILE"
+  echo "forge-builder: Claude run failed. Log: $LOG_FILE" >&2
+  exit 1
+}
+
+if [[ ! -s "$SUMMARY_FILE" ]]; then
+  log_action "build_error $NAME no_summary"
+  echo "forge-builder: no summary file produced. Log: $LOG_FILE" >&2
+  exit 1
+fi
+
+# v2 U2: post-run fallback — synthesize minimal activation memo if subprocess skipped.
+if [[ ! -s "$ACTIVATION_MEMO_FILE" ]]; then
+  log_action "build_soft_fail $NAME missing_activation_memo fallback_synthesized"
+  cat > "$ACTIVATION_MEMO_FILE" <<FALLBACK_MEMO
+---
+agent: $NAME
+built: $TIMESTAMP
+status: PENDING ACTIVATION
+fallback_memo: true
+---
+
+## Payoff
+- Hours saved per week: <TODO — subprocess skipped; fill from spec lane + cadence>
+- Payoff window: <TODO>
+
+## Cost
+- Estimated tokens per month: <TODO — compute from spec token tier × cadence × 30>
+- Monthly USD at Sonnet rates (ref only): <TODO>
+
+## Dependencies
+- Upstream agents/data: <TODO — copy from spec Inputs section>
+- Skills required: <TODO — copy from spec MCPs required>
+
+## Risk if underperforms
+- <TODO — derive top 3 from spec Hard failures>
+
+## Kill criteria
+- <TODO — specific measurable conditions for demotion/removal>
+
+## Scoreboard reference
+- ~/.forge-suite/entities/scoreboard.md (read-only, memo does not update)
+
+## ACTIVATION
+To activate: run \`$NAME\` from any terminal. No automatic activation on scaffold-complete.
+
+---
+
+**Fallback memo:** Builder subprocess did not write the full memo. Fill the TODO fields by reading $FORGE_HOME/queue/forge/${NAME}_spec.md before activation. This memo file is included in the scaffold commit for traceability.
+FALLBACK_MEMO
+  echo "forge-builder: activation memo fallback synthesized (subprocess skipped). Review before activating." >&2
+fi
+
+log_action "build_complete $NAME awaiting_activation"
+
+# v2 U1: append build_outcome=built row to diagnosis_patterns.md
+DIAGNOSIS_LOG="$FORGE_HOME/memory/diagnosis_patterns.md"
+if [[ -f "$DIAGNOSIS_LOG" ]] && ! $DRY_RUN; then
+  echo "| $NOW_ISO | $NAME | build_outcome | (see spec) | (see spec) | built | scaffolded at L0 by forge-builder |" >> "$DIAGNOSIS_LOG"
+fi
+
+if command -v forge-state-update &>/dev/null && ! $DRY_RUN; then
+  forge-state-update forge --outcome=success \
+    --json="{\"agent_specific\": {\"last_scaffolded_agent\": \"$NAME\", \"pending_activation\": 1}}" 2>/dev/null || true
+fi
+
+echo ""
+echo "forge-builder: scaffolded '$NAME' ($SPEC_TYPE)."
+echo "  Target:         $TARGET_DIR"
+echo "  Bin:            $HOME/.forge-suite/bin/$NAME"
+echo "  Summary:        $SUMMARY_FILE"
+echo "  Activation memo: $ACTIVATION_MEMO_FILE"
+echo ""
+echo "Next: read the activation memo (payoff / cost / kill criteria), then activate manually."
+
+exit 0

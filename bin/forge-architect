@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# forge-architect — Confirmed spec → Build design document BEFORE Builder runs.
+#
+# Usage:
+#   forge-architect <name>             Design from spec at ~/.forge-suite/queue/forge/<name>_spec.md
+#   forge-architect <name> --dry-run   Write everything under /tmp/forge-architect-<name>/
+#   forge-architect --help             Show usage
+#
+# Paths:
+#   Spec (reads):       ~/.forge-suite/queue/forge/<name>_spec.md
+#   Design doc:         ~/.forge-suite/queue/forge/designs/<name>_design.md
+#   Run summary:        ~/.forge-suite/outputs/forge/architect/<TS>_<name>_design_summary.md
+#   Journal:            ~/.forge-suite/journal/pending/architect_<TS>.md
+#
+# Exit codes:
+#   0   design doc produced, awaiting review before Builder runs
+#   1   general error (Claude run failed, summary missing, etc.)
+#   3   circuit breaker tripped
+#   21  spec Diagnosis still contains '<AWAITING CONFIRM OR REDIRECT>' placeholder — confirm first
+#   22  spec file not found — run forge-specman first
+#
+# Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
+
+set -euo pipefail
+
+FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+QUEUE_DIR="$FORGE_HOME/queue/forge"
+DESIGNS_DIR="$FORGE_HOME/queue/forge/designs"
+OUTPUT_DIR="$FORGE_HOME/outputs/forge/architect"
+JOURNAL_DIR="$FORGE_HOME/journal/pending"
+AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMESTAMP="$(date +%Y%m%d_%H%M)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$DESIGNS_DIR" "$OUTPUT_DIR" "$JOURNAL_DIR"
+
+die() { echo "forge-architect: $*" >&2; exit 1; }
+log_action() { echo "[$NOW_ISO] forge-architect $*" >> "$AUDIT_LOG"; }
+
+if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
+  sed -n '1,27p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+NAME="$1"
+shift
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    *)         die "unknown flag: $arg" ;;
+  esac
+done
+
+# Validate name
+[[ ! "$NAME" =~ ^[a-z][a-z0-9-]+$ ]] && die "invalid kebab-case name: $NAME"
+
+SPEC_FILE="$QUEUE_DIR/${NAME}_spec.md"
+
+# Preflight: spec exists?
+if [[ ! -f "$SPEC_FILE" ]]; then
+  log_action "refused_missing_spec $NAME"
+  echo "forge-architect: spec not found: $SPEC_FILE" >&2
+  echo "Run forge-specman first, then forge-specman --confirm-diagnosis $NAME." >&2
+  exit 22
+fi
+
+# Preflight: Diagnosis confirmed (not still placeholder)?
+if grep -q "<AWAITING CONFIRM OR REDIRECT>" "$SPEC_FILE"; then
+  log_action "refused_unconfirmed_diagnosis $NAME"
+  echo "forge-architect: Diagnosis section still contains an '<AWAITING CONFIRM OR REDIRECT>' placeholder." >&2
+  echo "Open $SPEC_FILE, redline the Diagnosis, then run:" >&2
+  echo "  forge-specman --confirm-diagnosis $NAME" >&2
+  echo "Once confirmed, re-run forge-architect $NAME." >&2
+  exit 21
+fi
+
+# Circuit breaker preflight (pin /usr/bin/python3 so PyYAML resolves correctly
+# even when Homebrew python3 is earlier in PATH)
+if command -v forge-cb &>/dev/null; then
+  PYTHON_PATH_SAVE="$PATH"
+  export PATH="/usr/bin:/usr/local/bin:$PATH"
+  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
+  export PATH="$PYTHON_PATH_SAVE"
+fi
+
+log_action "design_start $NAME spec_hash=$(md5 -q "$SPEC_FILE" 2>/dev/null || md5sum "$SPEC_FILE" | cut -d' ' -f1)"
+
+if $DRY_RUN; then
+  TARGET_DIR="/tmp/forge-architect-$NAME"
+  mkdir -p "$TARGET_DIR"
+  DESIGN_FILE="$TARGET_DIR/${NAME}_design.md"
+  SUMMARY_FILE="$TARGET_DIR/${TIMESTAMP}_${NAME}_design_summary.md"
+  JOURNAL_FILE="$TARGET_DIR/architect_${TIMESTAMP}.md"
+  echo "forge-architect: DRY RUN → $TARGET_DIR"
+else
+  DESIGN_FILE="$DESIGNS_DIR/${NAME}_design.md"
+  SUMMARY_FILE="$OUTPUT_DIR/${TIMESTAMP}_${NAME}_design_summary.md"
+  JOURNAL_FILE="$JOURNAL_DIR/architect_${TIMESTAMP}.md"
+fi
+
+PROMPT_FILE="$(mktemp /tmp/forge-architect-prompt.XXXXXX)"
+LOG_FILE="/tmp/forge-architect-${NAME}-${TIMESTAMP}.log"
+trap "rm -f $PROMPT_FILE" EXIT
+
+cat "$FORGE_HOME/agents/forge/architect/CLAUDE.md" > "$PROMPT_FILE"
+cat >> "$PROMPT_FILE" <<ARCHITECT_TASK
+
+---
+
+## TASK — Design: $NAME
+
+Spec file: $SPEC_FILE
+Design doc target: $DESIGN_FILE
+Run summary target: $SUMMARY_FILE
+Journal target: $JOURNAL_FILE
+Timestamp: $TIMESTAMP
+Dry run: $DRY_RUN
+
+Spec contents:
+$(cat "$SPEC_FILE")
+
+Required actions (execute in order using Write/Edit tools):
+
+1. Write $DESIGN_FILE — the build design document with ALL SIX required sections (from CLAUDE.md §Required Design Sections):
+
+   a. **## Components** — each component the build requires, one-line responsibility per component.
+
+   b. **## Data/State Files** — every file the agent will read from or write to. Include: absolute path, format (JSON/YAML/text/etc.), and purpose (read/write/append).
+
+   c. **## Dependencies** — all libs, MCPs, and credentials required. For EACH dependency declare:
+      - Name and source (stdlib / PyPI / MCP connector / etc.)
+      - Credential pattern (MCP / LIB / DSF / STATIC / SUB) — required for every external service.
+      - Brief note on how it is used in this build.
+      Derive ONLY from what the spec states. Do NOT invent dependencies.
+
+   d. **## Integration Points** — how the new build connects to existing bins and agents. For each integration point include the absolute path to the existing bin/lib and describe the connection (calls it, reads its output, shares its state file, etc.).
+
+   e. **## Risks** — exactly 3 (or more) specific risks for this build. Each risk must include:
+      - Risk name
+      - One-sentence description
+      - One-sentence mitigation
+      Must be SPECIFIC to this build — not generic "it might fail" boilerplate.
+
+   f. **## Verification Plan** — step-by-step plan that Verifier or the operator can run to confirm the build is working. Must include:
+      - Setup steps (any flags, sample inputs)
+      - Commands to run
+      - Expected outputs for each command
+      - Failure indicators (what a broken build looks like)
+      Must reference the ACTUAL commands for this build, not generic templates.
+
+2. Write $SUMMARY_FILE — run summary listing:
+   - Spec: $SPEC_FILE
+   - Design doc: $DESIGN_FILE
+   - All six sections: OK/MISSING checklist
+   - Dependency count
+   - Integration points count
+   - Risk count
+   - Final line: "AWAITING REVIEW — run forge-builder $NAME after approval"
+
+3. Write $JOURNAL_FILE — journal placeholder:
+   - agent: forge-architect
+   - name: $NAME
+   - run_at: $NOW_ISO
+   - design_file: $DESIGN_FILE
+   - summary_file: $SUMMARY_FILE
+   - One sentence on what design was produced.
+
+Hard constraints:
+- Design doc MUST have all 6 sections. Missing any section = hard failure per dof.md.
+- NEVER invent dependencies, MCPs, or credentials not referenced in the spec.
+- NEVER write to $FORGE_HOME/agents/$NAME/ (Builder's exclusive zone).
+- NEVER write bin scripts, CLAUDE.md files, or dof.md for the target agent.
+- No ANTHROPIC_API_KEY in any generated content.
+- Credential pattern must be declared for every external service dependency.
+- Risks must be specific to this build (3 minimum).
+- Verification plan must name real commands, not placeholders.
+
+Reference:
+- Credential lifecycle patterns: $FORGE_HOME/memory/architectural-decisions/2026-05-04_credential-lifecycle-ownership.md
+- Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
+- Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
+ARCHITECT_TASK
+
+"$CLAUDE_BIN" --model claude-sonnet-5 \
+  --permission-mode bypassPermissions \
+  --output-format text \
+  -p "$(cat "$PROMPT_FILE")" \
+  > /dev/null 2>"$LOG_FILE" || {
+  log_action "design_error $NAME see_log=$LOG_FILE"
+  echo "forge-architect: Claude run failed. Log: $LOG_FILE" >&2
+  exit 1
+}
+
+if [[ ! -s "$SUMMARY_FILE" ]]; then
+  log_action "design_error $NAME no_summary"
+  echo "forge-architect: no summary file produced. Log: $LOG_FILE" >&2
+  exit 1
+fi
+
+if [[ ! -s "$DESIGN_FILE" ]]; then
+  log_action "design_error $NAME no_design_doc"
+  echo "forge-architect: no design doc produced. Log: $LOG_FILE" >&2
+  exit 1
+fi
+
+log_action "design_complete $NAME awaiting_review design=$DESIGN_FILE"
+
+echo ""
+echo "forge-architect: design doc produced for '$NAME'."
+echo "  Spec:        $SPEC_FILE"
+echo "  Design doc:  $DESIGN_FILE"
+echo "  Summary:     $SUMMARY_FILE"
+echo ""
+echo "Next: review the design doc, then run: forge-builder $NAME"
+
+exit 0

@@ -1,0 +1,11 @@
+# Done-bar — outbound email
+- [ ] Recipient address matches the canonical CRM record, not a guess
+- [ ] Every fact in the body (names, dates, amounts, venues) matches its canonical source, checked one by one
+- [ ] Zero em-dashes anywhere in subject or body
+- [ ] No banned vocabulary per your brand's style guide
+- [ ] Signature block matches the email standards exactly (spacing included)
+- [ ] Brand lint passes for the email channel
+- [ ] Thread behavior correct: replies stay in-thread (reply-all), fresh sends get a clean subject
+- [ ] A Fact-Lock manifest exists and PASSED for this send
+- [ ] The send is staged to Approvals (or the agent holds L2+ with a passing gate) — never fired straight from a draft
+- [ ] Not a duplicate: no prior send of the same content to the same person

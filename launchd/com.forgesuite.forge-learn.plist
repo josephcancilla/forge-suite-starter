@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forgesuite.forge-learn</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOURNAME/.forge-suite/bin/forge-learn</string>
+        <string>all</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FORGE_HOME</key>
+        <string>/Users/YOURNAME/.forge-suite</string>
+        <key>CLAUDE_BIN</key>
+        <string>/Users/YOURNAME/.local/bin/claude</string>
+        <key>PATH</key>
+        <string>/Users/YOURNAME/.forge-suite/bin:/Users/YOURNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>ANTHROPIC_MODEL</key>
+    <string>claude-haiku-4-5</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/YOURNAME/.forge-suite/logs/forge/forge-learn.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURNAME/.forge-suite/logs/forge/forge-learn.err</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
+<!-- Activate when ready:
+     mkdir -p ~/.forge-suite/logs/forge
+     cp ~/.forge-suite/launchd/com.forgesuite.forge-learn.plist.example \
+        ~/Library/LaunchAgents/com.forgesuite.forge-learn.plist
+     launchctl load ~/Library/LaunchAgents/com.forgesuite.forge-learn.plist
+
+     Manual test (dry-run):
+     forge-learn all --dry-run
+-->
