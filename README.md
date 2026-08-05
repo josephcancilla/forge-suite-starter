@@ -47,4 +47,8 @@ are the checklists work must pass to be called finished.
 
 - Nothing here is secret or business-specific. Adapt the agent instructions, done-bars,
   and token budgets to your own workflow.
-- Private template. Share it with your own team or clients as a head start.
+- Share it with your own team or clients as a head start.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, adapt it, build on it.
