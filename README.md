@@ -31,6 +31,7 @@ are the checklists work must pass to be called finished.
 - `bin/` — the command scripts (`forge`, `verify`, and the `forge-*` sub-agent runners).
 - `lib/` — supporting Python libraries.
 - `launchd/` — an example scheduler entry (macOS) for the nightly learning run.
+- `skills/` — the design and website skills Designer uses (see `skills/README.md`).
 
 ## Setup
 
@@ -42,6 +43,7 @@ are the checklists work must pass to be called finished.
    included, by design** — the suite forbids them in any generated output. Wire your
    assistant per its own docs.
 4. Point the Designer's brand direction at your own brand tokens. It ships neutral.
+5. Install the skills: `cp -R skills/* ~/.claude/skills/`.
 
 ## Notes
 
@@ -52,3 +54,6 @@ are the checklists work must pass to be called finished.
 ## License
 
 MIT — see [LICENSE](LICENSE). Use it, adapt it, build on it.
+
+The third-party skills in `skills/` keep their own licenses (MIT or Apache-2.0),
+listed in `skills/README.md`.

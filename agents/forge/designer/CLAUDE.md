@@ -14,7 +14,7 @@ Designer exists so Builder never has to design UI. When a spec declares `type: w
 
 ## Design Skills
 
-Designer has five skills available via Claude's `Skill` tool. Each has a defined trigger condition. Use the narrowest applicable skill; stack them when a task spans multiple domains (e.g., web-build + web-design-guidelines review in one pass).
+Designer's skills ship in this repo's `skills/` folder (install with `cp -R skills/* ~/.claude/skills/`) and run via Claude's `Skill` tool. Each has a defined trigger condition. Use the narrowest applicable skill; stack them when a task spans multiple domains (e.g., web-build + web-design-guidelines review in one pass).
 
 | Skill | Invoke as | Local path | Trigger condition |
 |---|---|---|---|
@@ -23,6 +23,15 @@ Designer has five skills available via Claude's `Skill` tool. Each has a defined
 | `stitch-loop` | `stitch-loop` | `~/.claude/skills/stitch-loop/SKILL.md` | Spec-to-code transitions; iterative design-to-code feedback loop. Use when a spec is moving from wireframe/design tokens into working code incrementally. |
 | `shadcn-ui` | `shadcn-ui` | `~/.claude/skills/shadcn-ui/SKILL.md` | Component builds on the Next.js/Vercel product stack. Use when spec declares `stack: nextjs` or `stack: vercel` and `pages[]` entries include interactive components. |
 | `vercel-react-best-practices` | `vercel-react-best-practices` | `~/.claude/skills/vercel-react-best-practices/SKILL.md` | Performance audit on React/Next.js code. Runs alongside `web-design-guidelines` as second post-build gate. |
+| `impeccable` | `impeccable` | `~/.claude/skills/impeccable/SKILL.md` | Design direction, critique, and polish pass. Use to push a draft past safe and generic, or to audit hierarchy, spacing, and typography. |
+| `ui-ux-pro-max` | `ui-ux-pro-max` | `~/.claude/skills/ui-ux-pro-max/SKILL.md` | Picking a style, palette, or font pairing when the spec's brand direction is thin. |
+| `motion-design` | `motion-design` | `~/.claude/skills/motion-design/SKILL.md` | Spec calls for animation or micro-interactions. Sets the motion direction. |
+| `gsap-*` | `gsap-core`, `gsap-timeline`, `gsap-scrolltrigger`, `gsap-react`, `gsap-plugins`, `gsap-frameworks`, `gsap-utils`, `gsap-performance` | `~/.claude/skills/gsap-*/SKILL.md` | Implementing scroll-driven or timeline animation (e.g. scroll-video-hero). |
+| `diagram-design` | `diagram-design` | `~/.claude/skills/diagram-design/SKILL.md` | Charts, flowcharts, and diagrams inside a page or deck. |
+| `archify` | `archify` | `~/.claude/skills/archify/SKILL.md` | Architecture or workflow diagrams for docs and build write-ups. |
+| `copywriting` | `copywriting` | `~/.claude/skills/copywriting/SKILL.md` | Page copy for `type: web-site` specs: headlines, value props, CTAs. |
+| `cro` | `cro` | `~/.claude/skills/cro/SKILL.md` | Conversion review on landing pages and forms before ship. |
+| `seo-audit` | `seo-audit` | `~/.claude/skills/seo-audit/SKILL.md` | Post-build SEO check on public sites (titles, meta, headings, speed). |
 | `canvas-design` | `anthropic-skills:canvas-design` | Cloud-backed — no local path | PNG/PDF visual art, posters, branded assets. Invoked via Skill tool as `anthropic-skills:canvas-design`; does not require a local SKILL.md. |
 
 **Post-build audit pipeline:** `web-design-guidelines` (UX/a11y) + `vercel-react-best-practices` (performance). Both must pass before Designer ships.
