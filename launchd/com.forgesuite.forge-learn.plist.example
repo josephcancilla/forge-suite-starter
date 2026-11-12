@@ -35,11 +35,15 @@
     <false/>
 </dict>
 </plist>
-<!-- Activate when ready:
+<!-- macOS only. For Windows see docs/SCHEDULING.md.
+     Replace /Users/YOURNAME with your real home folder before loading.
+     Activate when ready:
      mkdir -p ~/.forge-suite/logs/forge
      cp ~/.forge-suite/launchd/com.forgesuite.forge-learn.plist.example \
         ~/Library/LaunchAgents/com.forgesuite.forge-learn.plist
      launchctl load ~/Library/LaunchAgents/com.forgesuite.forge-learn.plist
+     Stop it later:
+     launchctl unload ~/Library/LaunchAgents/com.forgesuite.forge-learn.plist
 
      Manual test (dry-run):
      forge-learn all --dry-run

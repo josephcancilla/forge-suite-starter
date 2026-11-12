@@ -24,12 +24,14 @@
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 DESIGNS_DIR="$FORGE_HOME/queue/forge/designs"
 OUTPUT_DIR="$FORGE_HOME/outputs/forge/architect"
 JOURNAL_DIR="$FORGE_HOME/journal/pending"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+mkdir -p "$(dirname "$AUDIT_LOG")"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 TIMESTAMP="$(date +%Y%m%d_%H%M)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -39,7 +41,7 @@ die() { echo "forge-architect: $*" >&2; exit 1; }
 log_action() { echo "[$NOW_ISO] forge-architect $*" >> "$AUDIT_LOG"; }
 
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
-  sed -n '1,27p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
@@ -77,14 +79,8 @@ if grep -q "<AWAITING CONFIRM OR REDIRECT>" "$SPEC_FILE"; then
   exit 21
 fi
 
-# Circuit breaker preflight (pin /usr/bin/python3 so PyYAML resolves correctly
-# even when Homebrew python3 is earlier in PATH)
-if command -v forge-cb &>/dev/null; then
-  PYTHON_PATH_SAVE="$PATH"
-  export PATH="/usr/bin:/usr/local/bin:$PATH"
-  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
-  export PATH="$PYTHON_PATH_SAVE"
-fi
+# Circuit breaker preflight (daily token cap; see bin/forge-cb)
+forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
 
 log_action "design_start $NAME spec_hash=$(md5 -q "$SPEC_FILE" 2>/dev/null || md5sum "$SPEC_FILE" | cut -d' ' -f1)"
 
@@ -106,6 +102,10 @@ LOG_FILE="/tmp/forge-architect-${NAME}-${TIMESTAMP}.log"
 trap "rm -f $PROMPT_FILE" EXIT
 
 cat "$FORGE_HOME/agents/forge/architect/CLAUDE.md" > "$PROMPT_FILE"
+# Lessons written by forge-learn reach this run.
+if [[ -f "$FORGE_HOME/agents/forge/architect/LESSONS.md" ]]; then
+  { printf '\n\n---\n\n## Lessons from earlier runs (read, then apply)\n\n'; cat "$FORGE_HOME/agents/forge/architect/LESSONS.md"; } >> "$PROMPT_FILE"
+fi
 cat >> "$PROMPT_FILE" <<ARCHITECT_TASK
 
 ---
@@ -179,15 +179,14 @@ Hard constraints:
 - Verification plan must name real commands, not placeholders.
 
 Reference:
-- Credential lifecycle patterns: $FORGE_HOME/memory/architectural-decisions/2026-05-04_credential-lifecycle-ownership.md
-- Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
-- Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
+- Promoted patterns (if the file exists): $FORGE_HOME/memory/promoted_patterns.md
+- Demoted patterns (if the file exists): $FORGE_HOME/memory/demoted_patterns.md
 ARCHITECT_TASK
 
-"$CLAUDE_BIN" --model claude-sonnet-5 \
+"$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
   --permission-mode bypassPermissions \
   --output-format text \
-  -p "$(cat "$PROMPT_FILE")" \
+  -p < "$PROMPT_FILE" \
   > /dev/null 2>"$LOG_FILE" || {
   log_action "design_error $NAME see_log=$LOG_FILE"
   echo "forge-architect: Claude run failed. Log: $LOG_FILE" >&2

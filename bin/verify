@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""verify — org-wide verification front door (the Verifier, promoted).
+"""verify - the general verification front door (the Verifier).
 
-Any agent or loop can route a deliverable through this. It is the same
-Verifier that gates Forge builds (agents/forge/verifier, L1) given a
+Any agent or script can route a deliverable through this. It is the same
+Verifier that gates Forge builds (agents/forge/verifier), given a
 general-purpose entry point; forge-verifier remains the Forge-lane caller.
 
-Design guarantees (hardening mandate 2026-07-03):
+Design guarantees:
   Independence   — judgment runs in a FRESH claude subprocess that receives
                    only: the deliverable, the done-bar checklist, and live
                    source paths. It never sees the maker's reasoning.
@@ -18,6 +18,12 @@ Design guarantees (hardening mandate 2026-07-03):
   Live sources   — reads the actual files fresh off disk at verify time.
   Iteration cap  — 3 rounds per task name, then verdict ESCALATE with a
                    plain-English blocker list for the operator.
+  Always a verdict — if verify itself crashes, it still prints one parseable
+                   JSON line (verdict FAIL) with --json, so a caller reading
+                   the last stdout line never gets an empty result.
+  Prior-art gate — a done-bar containing the line <!-- gate:prior-art -->
+                   also requires each deliverable (a spec) to pass
+                   lib/forge_prior_art.py before judgment.
 
 Usage:
   verify --task <name> --deliverable <path> [--deliverable <path> ...]
@@ -25,36 +31,41 @@ Usage:
          [--json]
 
 Exit codes: 0 PASS · 1 FAIL · 2 ESCALATE (cap hit) · 3 usage/infra error
-Verdicts + reports land in ~/.forge-suite/outputs/verifier/.
+Verdicts + reports land in $FORGE_HOME/outputs/verifier/ (default ~/.forge-suite).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-FORGE_HOME = Path.home() / ".forge-suite"
+FORGE_HOME = Path(os.environ.get("FORGE_HOME", Path.home() / ".forge-suite"))
 OUT_DIR = FORGE_HOME / "outputs" / "verifier"
 STATE_DIR = FORGE_HOME / "state" / "verifier"
-PHX = ZoneInfo("America/Phoenix")
 MAX_ROUNDS = 3
 
 EM_DASH = "—"
 
 
 def _now() -> str:
-    return datetime.now(PHX).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _claude_bin() -> str | None:
+    env = os.environ.get("CLAUDE_BIN")
+    if env:
+        return env
+    found = shutil.which("claude")
+    if found:
+        return found
     known = Path.home() / ".local" / "bin" / "claude"
-    return str(known) if known.exists() else shutil.which("claude")
+    return str(known) if known.exists() else None
 
 
 def _rounds(task: str) -> dict:
@@ -84,6 +95,22 @@ def reset_rounds(task: str) -> None:
     if task in data:
         del data[task]
         f.write_text(json.dumps(data, indent=1))
+
+
+def prior_art_gate_failures(donebar_text: str, deliverables: list[Path]) -> list[str]:
+    """Opt-in gate: a done-bar with <!-- gate:prior-art --> requires every deliverable to pass lib/forge_prior_art.py."""
+    if not re.search(r"^[ \t]*<!-- gate:prior-art -->[ \t]*$", donebar_text, re.M):
+        return []
+    lib_dir = str(Path(__file__).resolve().parent.parent / "lib")
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    from forge_prior_art import check_file
+    failures = []
+    for d in deliverables:
+        reasons = check_file(d)
+        if reasons:
+            failures.append(f"{d}: {', '.join(reasons)}")
+    return failures
 
 
 def deterministic_checks(deliverables: list[Path], sources: list[Path],
@@ -153,8 +180,9 @@ def llm_judgment(deliverables: list[Path], donebar: Path,
           "\"break_found\": \"the sharpest defect, or null\"}"
     )
     try:
-        r = subprocess.run([claude, "--model", "claude-sonnet-5", "-p", prompt],
-                           capture_output=True, text=True, timeout=600)
+        # The prompt goes in on stdin: long prompts would hit the Windows command-line limit.
+        r = subprocess.run([claude, "--model", os.environ.get("FORGE_VERIFY_MODEL", os.environ.get("FORGE_MODEL", "claude-sonnet-5")), "-p"],
+                           input=prompt, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         return None, "verifier judgment timed out — failing closed"
     if r.returncode != 0:
@@ -197,7 +225,7 @@ def main() -> int:
 
     rnd = _bump_round(args.task)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(PHX).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if rnd > MAX_ROUNDS:
         blockers = (f"Task '{args.task}' has failed verification {MAX_ROUNDS} times. "
@@ -210,6 +238,8 @@ def main() -> int:
         return 2
 
     det = deterministic_checks(deliverables, sources, args.outbound)
+    for failure in prior_art_gate_failures(donebar.read_text(errors="ignore"), deliverables):
+        det.append({"id": "prior_art", "pass": False, "evidence": failure})
     det_fail = [c for c in det if not c["pass"]]
     if det_fail:
         passed, detail = False, "deterministic checks failed: " + "; ".join(
@@ -225,7 +255,7 @@ def main() -> int:
     report = OUT_DIR / f"{ts}_{args.task}_{verdict}.md"
     report.write_text(
         f"# Verifier verdict — {args.task}\n\n"
-        f"**{verdict}** (round {rnd}/{MAX_ROUNDS}) at {_now()} Phoenix\n\n"
+        f"**{verdict}** (round {rnd}/{MAX_ROUNDS}) at {_now()}\n\n"
         f"Done-bar: {donebar}\n"
         f"Deliverables: {', '.join(str(d) for d in deliverables)}\n\n"
         f"## Deterministic checks\n"
@@ -238,4 +268,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Always leave one parseable JSON line on stdout, even if main() blows up.
+    # The traceback still goes to stderr; only a stdout line is added.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as _exc:
+        import traceback
+        traceback.print_exc()
+        print(json.dumps({
+            "verdict": "FAIL",
+            "round": 0,
+            "detail": f"verify crashed before producing a verdict: {type(_exc).__name__}: {_exc}",
+            "report": None,
+        }))
+        sys.exit(3)

@@ -1,9 +1,11 @@
 # Skills
 
 Design and website skills the Forge Designer (and any build session) can use.
-Copy each folder into `~/.claude/skills/` to install:
+Copy each folder into `~/.claude/skills/` to install (on Windows, run this in Git Bash; the
+folder is `%USERPROFILE%\.claude\skills`):
 
 ```bash
+mkdir -p ~/.claude/skills
 cp -R skills/* ~/.claude/skills/
 ```
 

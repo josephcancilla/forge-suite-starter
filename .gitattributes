@@ -1,0 +1,7 @@
+# Keep Unix line endings so the shell and Python scripts run in Git Bash on Windows.
+* text=auto
+bin/* text eol=lf
+lib/*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf

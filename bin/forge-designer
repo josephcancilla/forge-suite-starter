@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# forge-designer — Frontend-design skill for web builds + universal UX pass (v2 U3).
+# forge-designer — Frontend-design skill for web builds + universal UX pass.
 #
 # Modes:
 #   default (web build): forge-designer <name>
 #     Invokes frontend-design skill for spec at ~/.forge-suite/queue/forge/<name>_spec.md.
 #     Requires spec type=web-app or web-site. 120K/25K token bucket.
 #
-#   ux-review (v2 U3):   forge-designer --mode=ux-review --target=<path>
+#   ux-review:            forge-designer --mode=ux-review --target=<path>
 #     Reads any file (spec, CLAUDE.md, bin, doc) and returns clarity/readability
 #     notes + prompt-design suggestions. No type gate. 30K/6K token bucket.
 #
@@ -35,13 +35,15 @@
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 OUTPUT_DIR="$FORGE_HOME/outputs/forge/designer"
 UX_OUTPUT_DIR="$OUTPUT_DIR/ux-reviews"
 JOURNAL_DIR="$FORGE_HOME/journal/pending"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
+mkdir -p "$(dirname "$AUDIT_LOG")"
 SKILL_DIR="$HOME/.claude/skills/frontend-design"
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 TIMESTAMP="$(date +%Y%m%d_%H%M)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -51,7 +53,7 @@ die() { echo "forge-designer: $*" >&2; exit "${2:-1}"; }
 log_action() { echo "[$NOW_ISO] forge-designer $*" >> "$AUDIT_LOG"; }
 
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
-  sed -n '1,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
@@ -67,18 +69,16 @@ for arg in "$@"; do
     --mode=*)          die "unknown mode: ${arg#--mode=}" ;;
     --target=*)        TARGET="${arg#--target=}" ;;
     --dry-run)         DRY_RUN=true ;;
-    --help)            sed -n '1,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help)            sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "unknown flag: $arg" ;;
     *)                 NAME="$arg" ;;
   esac
 done
 
 # Circuit breaker (both modes)
-if command -v forge-cb &>/dev/null; then
-  forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
-fi
+forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
 
-# ========== UX REVIEW MODE (v2 U3) ==========
+# ========== UX REVIEW MODE ==========
 if [[ "$MODE" == "ux-review" ]]; then
   [[ -z "$TARGET" ]] && die "--mode=ux-review requires --target=<path>"
   [[ ! -f "$TARGET" ]] && die "target file not found: $TARGET"
@@ -97,7 +97,7 @@ if [[ "$MODE" == "ux-review" ]]; then
   trap "rm -f $PROMPT_FILE" EXIT
 
   cat > "$PROMPT_FILE" <<UX_TASK
-You are forge-designer running in UX-REVIEW mode. Read the target file and produce a clarity/readability review, plus up to three prompt-design suggestions. This is a v2 U3 universal UX pass — no type gate, no design artifacts, just a review.
+You are forge-designer running in UX-REVIEW mode. Read the target file and produce a clarity/readability review, plus up to three prompt-design suggestions. This is a universal UX pass — no type gate, no design artifacts, just a review.
 
 Target file: $TARGET
 Target basename: $TARGET_BASENAME
@@ -160,10 +160,10 @@ Hard constraints:
 - Do not modify the target file. Read-only.
 UX_TASK
 
-  "$CLAUDE_BIN" --model claude-sonnet-5 \
+  "$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
     --permission-mode acceptEdits \
     --output-format text \
-    -p "$(cat "$PROMPT_FILE")" \
+    -p < "$PROMPT_FILE" \
     > /dev/null 2>"$LOG_FILE" || {
     log_action "ux_review_error target=$TARGET see_log=$LOG_FILE"
     echo "forge-designer: UX review failed. Log: $LOG_FILE" >&2
@@ -191,8 +191,8 @@ fi
 
 if [[ ! -f "$SKILL_DIR/SKILL.md" ]]; then
   echo "forge-designer: \`frontend-design\` skill not installed."
-  echo "Install it first:"
-  echo "  forge-skill-install https://github.com/anthropics/skills/tree/main/skills/frontend-design"
+  echo "Install it first (copy it from this suite's skills folder):"
+  echo "  cp -R \"$FORGE_HOME/skills/frontend-design\" \"$HOME/.claude/skills/\""
   log_action "hard_fail skill_missing frontend-design"
   exit 4
 fi
@@ -215,6 +215,10 @@ trap "rm -f $PROMPT_FILE" EXIT
 SKILL_CONTENT="$(cat "$SKILL_DIR/SKILL.md")"
 
 cat "$FORGE_HOME/agents/forge/designer/CLAUDE.md" > "$PROMPT_FILE"
+# Lessons written by forge-learn reach this run.
+if [[ -f "$FORGE_HOME/agents/forge/designer/LESSONS.md" ]]; then
+  { printf '\n\n---\n\n## Lessons from earlier runs (read, then apply)\n\n'; cat "$FORGE_HOME/agents/forge/designer/LESSONS.md"; } >> "$PROMPT_FILE"
+fi
 
 cat >> "$PROMPT_FILE" <<DESIGNER_TASK
 
@@ -251,10 +255,10 @@ Hard constraints:
 - Do not activate or deploy. Write files only.
 DESIGNER_TASK
 
-"$CLAUDE_BIN" --model claude-sonnet-5 \
+"$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
   --permission-mode acceptEdits \
   --output-format text \
-  -p "$(cat "$PROMPT_FILE")" \
+  -p < "$PROMPT_FILE" \
   > /dev/null 2>"$LOG_FILE" || {
   log_action "design_error $NAME see_log=$LOG_FILE"
   echo "forge-designer: Claude run failed. Log: $LOG_FILE" >&2

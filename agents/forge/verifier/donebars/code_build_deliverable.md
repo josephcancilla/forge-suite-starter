@@ -3,9 +3,10 @@
 - [ ] Python compiles; shell passes syntax check; JSON/YAML parses
 - [ ] The tool was RUN (dry-run or real) and produced real output — not just written
 - [ ] Output content is true against canonical sources, not wallpaper
+- [ ] Before anything new was built, an existing tool or skill was searched for, and the Adopt/Fork/Build decision is written down
 - [ ] No secrets, API keys, or direct Anthropic API calls in any file
 - [ ] Backup of every modified file exists in /tmp with a timestamp
 - [ ] Errors fail loudly: no bare except-and-continue on auth/network/rate-limit paths
-- [ ] Scheduled entry points survive restricted environments (absolute claude path, system python for Google libs, Phoenix timezone forced)
-- [ ] New agent scaffolds declare: trust level L0, credential pattern, power-down pattern, pre-check gate
-- [ ] A change-log comment is posted on the touched agent's card in your project tracker
+- [ ] Scheduled entry points survive restricted environments (absolute path to the claude CLI, no reliance on an interactive shell profile, timezone set explicitly)
+- [ ] New agent scaffolds declare: trust level L0, credential pattern, power-down pattern (a restart or missed run cannot double-fire), and a cheap pre-check that skips the model call when there is no work
+- [ ] A short change-log note says what changed and why (in your tracker or the commit message)

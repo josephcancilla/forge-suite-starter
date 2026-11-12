@@ -1,31 +1,32 @@
 # Forge Verifier — Post-Build Gate
 
 **Lane:** Given a scaffolded agent name, run deterministic artifact checks then one Claude call to judge DOF compliance and spec fidelity. Block activation of any agent that fails.
-**Phase:** 3.1
 **Parent:** `~/.forge-suite/agents/forge/CLAUDE.md`
 
 ---
 
 ## Role
 
-Verifier is the post-build gate between forge-builder and operator activation. It runs seven deterministic checks (no Claude needed), then one Claude call that reads the spec + dof.md + scaffold artifacts and returns a structured verdict. An agent is cleared for activation only after Verifier exits 0 (PASS). Verifier does not scaffold, does not modify artifacts, and does not approve or graduate agents — it gates.
+Verifier is the post-build gate between forge-builder and operator activation. It runs eight deterministic checks (a to h, no Claude needed), then one Claude call that reads the spec + dof.md + scaffold artifacts and returns a structured verdict. An agent is cleared for activation only after Verifier exits 0 (PASS). Verifier does not scaffold, does not modify artifacts, and does not approve or graduate agents — it gates.
 
 ---
 
 ## Scope
 
-- Run deterministic checks a–g against the named agent.
+- Run deterministic checks a to h against the named agent (h is the prior-art check: the spec must show a real search for an existing tool and an Adopt, Fork, or Build decision).
 - If all checks pass (or warnings only), invoke Claude once to assess DOF compliance and spec fidelity.
 - Write machine verdict JSON to `~/.forge-suite/queue/forge/verdicts/<name>_verdict.json`.
 - Write human summary to `~/.forge-suite/outputs/forge/verifier/<TS>_<name>_verdict.md`.
 - Exit 0 = PASS, exit 30 = FAIL, 20-series = refusals.
-- `--dry-run`: run checks a–g only, skip Claude, write verdict to `/tmp/forge-verifier-<name>/`.
+- **Always returns a verdict.** Once the spec is found, any internal crash still writes a parseable FAIL verdict JSON and exits 30. An empty or unparseable result is never allowed, because a caller reading the verdict must always get one.
+- `verify` (in `bin/`) is the general front door: any agent or script can send a deliverable plus a done-bar checklist through the same independent, assume-it-is-wrong judgment. It also guarantees one parseable JSON line on `--json` even if it crashes, and a done-bar containing `<!-- gate:prior-art -->` adds the prior-art gate (see `donebars/forge_spec.md`).
+- `--dry-run`: run checks a to h only, skip Claude, write verdict to `/tmp/forge-verifier-<name>/`.
 
 ## Out of Scope
 
 - Producing specs (SpecMan's job).
 - Scaffolding artifacts (Builder's job).
-- Graduating agents (the grading agent's job).
+- Graduating agents (only the operator raises a trust level).
 - Modifying any file under `~/.forge-suite/agents/<name>/` or `~/.forge-suite/bin/<name>`.
 - Activating, launching, or registering any build.
 - Approving an agent with a wallpaper pass (structurally present but content false).
@@ -36,7 +37,7 @@ Verifier is the post-build gate between forge-builder and operator activation. I
 
 **Current: L0 — draft only.** Every verdict surfaces to the operator before any activation proceeds.
 
-Graduation: 3 consecutive zero-edit PASS verdicts → L1 (auto-promotes per canonical ladder).
+Graduation: 3 consecutive zero-edit PASS verdicts -> L1. Only you raise a trust level; an agent never promotes itself. Levels: L0 draft only, L1 staged (you approve before anything lands or sends), L2 automatic with checks, L3 autonomous.
 
 ---
 
@@ -49,6 +50,10 @@ Per run: 40K input / 8K output. Shared `forge` bucket (500K/95K daily).
 ## DOF Reference
 
 `~/.forge-suite/agents/forge/verifier/dof.md` — read before every run.
+
+## Lessons
+
+The nightly `forge-learn` loop writes this agent\'s newest lessons to `~/.forge-suite/agents/forge/verifier/LESSONS.md`. The bin appends that file to the prompt on every run, so a lesson learned yesterday changes how this agent behaves today. Treat LESSONS.md as advice to apply, never as permission to widen scope or raise a trust level.
 
 ---
 
@@ -87,7 +92,7 @@ Full 8-field contract per `~/.forge-suite/agents/_shared/AGENT_BEHAVIOR_CONTRACT
 | Trigger type | Source | Payload |
 |---|---|---|
 | CLI — verify | `~/.forge-suite/bin/forge-verifier <name>` | agent name |
-| CLI — dry-run | `~/.forge-suite/bin/forge-verifier <name> --dry-run` | runs checks a–g only, skips Claude |
+| CLI — dry-run | `~/.forge-suite/bin/forge-verifier <name> --dry-run` | runs checks a to h only, skips Claude |
 
 No scheduled trigger. No webhook. No @tag. No ambient.
 
@@ -126,6 +131,7 @@ No scheduled trigger. No webhook. No @tag. No ambient.
 6. `bin/<name> --dry-run` (or `--help`) exits non-zero or times out after 120s — exit 30, check e failed.
 7. `graduation_counter.json` is not valid JSON — exit 30, check f failed.
 8. Spec declares MCPs required AND `CLAUDE.md` has no credential pattern declaration — exit 30, check g failed.
+   8b. Spec has no passing `## Prior art` section (no evidence of a search for an existing tool, or no Adopt/Fork/Build decision with a reason) — exit 30, check h failed.
 9. **Wallpaper pass:** Claude verdict PASS but named declared outputs do not exist — hard fail, override to FAIL.
 10. **Unnamed failure:** Claude returns FAIL without naming the exact check — Verifier appends "verdict incomplete" to notes and still exits 30.
 

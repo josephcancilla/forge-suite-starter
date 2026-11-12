@@ -7,17 +7,18 @@
 #   forge new <agent-name> --dry-run    Scaffold to /tmp for review
 #   forge spec                          Print required spec format
 #   forge validate <agent-name>         Re-validate existing scaffold against DOF
-#   forge retrofit-ack                  Acknowledge retrofit readiness (defer)
-#   forge retrofit <agent-name>         Start retrofit work on <agent> — auto-acks readiness
-#                                       [LOCKED: requires --yes-i-know until v2]
+#   forge approve <agent-name>          Record that you approved a drafted scaffold
+#   forge audit <agent-name> | --all    Score agents against the Forge criteria
+#   forge upgrade <agent-name>          Write an upgrade spec for an agent (you review it)
+#   forge sweep                         Audit all + queue upgrade specs for the 3 weakest
+#   forge skill-request --description "<gap>" [--url <github>]   Log a skill gap
 #
 # Flags:
 #   --dry-run            Write to /tmp/forge-<name>/, no commit
-#   --tier=<name>        Token tier: sunshine | triage | cleanup | research
+#   --tier=<name>        Token tier: light | standard | heavy | research
 #   --custom-tier        Required alongside --tier if using a non-standard tier
 #   --verbose            Emit every file write
 #   --approve            Post-review flag — the operator runs this to record scaffold approval
-#   --yes-i-know         Unlock locked commands (retrofit in v1)
 #
 # Paths:
 #   Inputs:   ~/.forge-suite/queue/forge/<name>_spec.md  OR  stdin
@@ -25,30 +26,27 @@
 #             ~/.forge-suite/outputs/forge/<YYYYMMDD_HHMM>_<name>.md (summary)
 #   Audit:    ~/.forge-suite/audit/actions.log
 #   Journal:  ~/.forge-suite/journal/pending/forge_<timestamp>.md
-#   State:    ~/.forge-suite/dashboard/state/forge.json  (via forge-state-update)
-#   Retrofit: ~/.forge-suite/agents/forge/retrofit_readiness.json
 #
 # Exit codes:
 #   0  scaffold drafted, awaiting approval
 #   1  spec invalid or missing required fields (gap report written)
 #   2  name collision or path outside ~/.forge-suite/agents/
 #   3  circuit breaker tripped
-#   4  command locked (retrofit without --yes-i-know)
-#   5  retrofit-ack: readiness not yet met (nothing to ack)
 #
 # Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
 
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 FORGE_DIR="$FORGE_HOME/agents/forge"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 OUTPUT_DIR="$FORGE_HOME/outputs/forge"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
-RETROFIT_JSON="$FORGE_DIR/retrofit_readiness.json"
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+mkdir -p "$(dirname "$AUDIT_LOG")"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 TIMESTAMP="$(date +%Y%m%d_%H%M)"
-NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%S-07:00)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -62,12 +60,10 @@ die() {
 }
 
 require_cb() {
-  if command -v forge-cb &>/dev/null; then
-    forge-cb check forge --input="${1:-0}" --output="${2:-0}" || {
-      log_action "circuit_breaker_tripped"
-      exit 3
-    }
-  fi
+  forge-cb check forge --input="${1:-0}" --output="${2:-0}" || {
+    log_action "circuit_breaker_tripped"
+    exit 3
+  }
 }
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
@@ -84,7 +80,7 @@ case "$COMMAND" in
     shift || true
 
     DRY_RUN=false
-    TIER="triage"
+    TIER="standard"
     VERBOSE=false
 
     for arg in "$@"; do
@@ -192,7 +188,7 @@ Required actions (execute in order using Write and Bash tools):
 1. Validate the spec contains all 9 required fields from your Mandatory Scaffold Checklist PLUS the 8-field Behavior Contract (Identity, Triggers, Ambient listening, Blast radius, Silence contract, Failure modes, Dedup strategy, Deployment — see $FORGE_HOME/agents/_shared/AGENT_BEHAVIOR_CONTRACT.md). If any field is missing, write a gap report to $GAP_FILE listing the missing fields, then output "GAPS FOUND — see $GAP_FILE" and stop.
 2. Write $TARGET_DIR/dof.md — Hard Failures (min 3), Soft Failures (min 2), Not Failures, Monitoring, Last Reviewed.
 3. Write $TARGET_DIR/CLAUDE.md — trust ladder gates, circuit breaker caps, DOF reference path, VOICE_PROFILE reference, output path conventions, session end instructions, a "## Silence Contract" section referencing $FORGE_HOME/agents/_shared/silence_rule.md, and a "## Behavior Contract" section echoing the 8 fields from the spec.
-4. Write $HOME/.forge-suite/bin/$AGENT_NAME — usage comment header, flags list, paths, exit codes, auth note (NO ANTHROPIC_API_KEY), forge-state-update call at run end. Then run: chmod +x $HOME/.forge-suite/bin/$AGENT_NAME
+4. Write $FORGE_HOME/bin/$AGENT_NAME — usage comment header, flags list, paths, exit codes, auth note (NO ANTHROPIC_API_KEY), a \`--dry-run\` flag. Then run: chmod +x $FORGE_HOME/bin/$AGENT_NAME
 5. Write $SUMMARY_FILE — agent name, tier ($TIER), list of all files created, 9-field checklist + 8-field Behavior Contract confirmed (each with OK/MISSING), final line: "AWAITING APPROVAL".
 
 Reference templates at: $FORGE_HOME/agents/_templates/forge_reference/
@@ -202,10 +198,10 @@ SCAFFOLD_TASK
 
     log_action "scaffold_start $AGENT_NAME spec=$(md5 -q "$SPEC_FILE" 2>/dev/null || md5sum "$SPEC_FILE" | cut -d' ' -f1)"
 
-    "$CLAUDE_BIN" --model claude-sonnet-5 \
+    "$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
       --permission-mode acceptEdits \
       --output-format text \
-      -p "$(cat "$FORGE_PROMPT_FILE")" \
+      -p < "$FORGE_PROMPT_FILE" \
       > /dev/null 2>"$LOG_FILE" || true
 
     if [[ ! -s "$SUMMARY_FILE" ]]; then
@@ -215,11 +211,6 @@ SCAFFOLD_TASK
     fi
 
     log_action "scaffold_draft $AGENT_NAME awaiting_approval"
-
-    if ! $DRY_RUN; then
-      forge-state-update forge --outcome=success \
-        --json="{\"agent_specific\": {\"scaffolds_awaiting_approval\": 1, \"last_scaffolded_agent\": \"$AGENT_NAME\"}}" 2>/dev/null || true
-    fi
 
     echo ""
     echo "Forge: scaffold drafted for '$AGENT_NAME'. Review at $TARGET_DIR"
@@ -237,30 +228,6 @@ SCAFFOLD_TASK
     fi
 
     log_action "scaffold_approved $AGENT_NAME"
-
-    # Update retrofit_readiness.json — add agent with today's date
-    python3 - <<PYEOF
-import json, datetime
-
-with open('$RETROFIT_JSON', 'r') as f:
-    data = json.load(f)
-
-existing = [a['name'] for a in data['scaffolded_agents']]
-if '$AGENT_NAME' not in existing:
-    data['scaffolded_agents'].append({
-        'name': '$AGENT_NAME',
-        'activated_date': None,
-        'hard_failures_since': 0,
-        'days_operated': 0
-    })
-
-with open('$RETROFIT_JSON', 'w') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-PYEOF
-
-    forge-state-update forge --outcome=success \
-      --json="{\"agent_specific\": {\"scaffolds_awaiting_approval\": 0, \"pending_approvals\": 0}}" 2>/dev/null || true
 
     echo "Forge: '$AGENT_NAME' scaffold recorded as approved. Activate it when you're ready."
     exit 0
@@ -294,7 +261,7 @@ PYEOF
 <List MCPs this agent needs, or "none">
 
 ## Token tier
-<sunshine | triage | cleanup | research | custom (justify below)>
+<light | standard | heavy | research | custom (justify below)>
 
 ## Hard failures (minimum 3)
 - <failure condition>
@@ -410,9 +377,9 @@ SPEC_FORMAT
     fi
     ;;
 
-  # ── forge retrofit / retrofit-ack — renamed to 'upgrade' in v2 ─────
+  # ── forge retrofit / retrofit-ack: old names, replaced by 'upgrade' ──
   retrofit|retrofit-ack)
-    echo "forge: '$COMMAND' was renamed to 'upgrade' in Forge v2 (2026-05-15)."
+    echo "forge: '$COMMAND' was replaced by 'upgrade'."
     echo "  Run: forge upgrade <agent>"
     echo "  Or:  forge audit <agent>   (score-only, no spec)"
     exit 0
@@ -570,7 +537,7 @@ PYEOF
     SCORE=$(echo "$AUDIT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['score'])")
     STATUS=$(echo "$AUDIT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
     log_action "audit $AGENT_NAME score=$SCORE status=$STATUS report=$REPORT_FILE"
-    echo "Forge audit: $AGENT_NAME → $SCORE/100 ($STATUS)"
+    echo "Forge audit: $AGENT_NAME -> $SCORE/100 ($STATUS)"
     echo "Report: $REPORT_FILE"
     exit 0
     ;;
@@ -584,9 +551,9 @@ PYEOF
     for arg in "$@"; do
       [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
       [[ "$arg" == "--apply" ]] && {
-        echo "forge: --apply mode not implemented in v2.0 (spec-generation only)."
+        echo "forge: --apply mode not implemented (spec-generation only)."
         echo "  Review the spec at ~/.forge-suite/queue/forge/${AGENT_NAME}_upgrade_spec.md"
-        echo "  Apply step lands in v2.1."
+        echo ""
         exit 4
       }
     done
@@ -603,7 +570,7 @@ PYEOF
     log_action "upgrade_spec_drafted $AGENT_NAME score=$SCORE spec=$SPEC_PATH"
     echo "Forge upgrade spec drafted: $SPEC_PATH"
     echo "  Score: $SCORE/100"
-    echo "  You review; apply step deferred to v2.1."
+    echo "  You review; apply step is not automated."
     exit 0
     ;;
 
@@ -629,7 +596,7 @@ print('\n'.join(a['agent'] for a in needs[:3]))
       [[ -z "$agent" ]] && continue
       SPEC_RESULT=$(python3 "$FORGE_HOME/lib/forge_upgrade_spec.py" "$agent" $($DRY_RUN && echo --dry-run) 2>/dev/null) || continue
       SPEC_PATH=$(echo "$SPEC_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['spec'])")
-      SPEC_LIST+="$agent → $SPEC_PATH"$'\n'
+      SPEC_LIST+="$agent -> $SPEC_PATH"$'\n'
       SPEC_COUNT=$((SPEC_COUNT + 1))
       log_action "sweep_spec_drafted $agent spec=$SPEC_PATH"
     done <<< "$TOP3"
@@ -656,7 +623,7 @@ print(f'{len(d)}|{h}|{deg}|{n}')
       echo "## Next steps"
       echo ""
       echo "You review each spec in \`~/.forge-suite/queue/forge/<agent>_upgrade_spec.md\` and decide which to apply."
-      echo "Apply step is NOT IN SCOPE for Forge v2.0 — spec-generation only."
+      echo "Apply step is NOT IN SCOPE for Forge: spec-generation only."
       echo ""
     } > "$SWEEP_REPORT"
     log_action "sweep_run agents=$N_AGENTS upgrade_specs=$SPEC_COUNT report=$SWEEP_REPORT"
@@ -670,7 +637,6 @@ print(f'{len(d)}|{h}|{deg}|{n}')
     DESCRIPTION=""
     URL=""
     FROM="commander"
-    INSTALL=false
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --description) DESCRIPTION="${2:-}"; shift 2 ;;
@@ -679,21 +645,13 @@ print(f'{len(d)}|{h}|{deg}|{n}')
         --url=*) URL="${1#--url=}"; shift ;;
         --from) FROM="${2:-}"; shift 2 ;;
         --from=*) FROM="${1#--from=}"; shift ;;
-        --install) INSTALL=true; shift ;;
         *) shift ;;
       esac
     done
-    [[ -z "$DESCRIPTION" ]] && die "Usage: forge skill-request --description \"<gap>\" [--url <github>] [--install]"
+    [[ -z "$DESCRIPTION" ]] && die "Usage: forge skill-request --description \"<gap>\" [--url <github>]"
     SKILL_QUEUE="$FORGE_HOME/queue/forge/skill-requests.jsonl"
     mkdir -p "$(dirname "$SKILL_QUEUE")"
-    STATUS="queued"
-    if $INSTALL && [[ -n "$URL" ]] && [[ -x "$FORGE_HOME/bin/forge-skill-install" ]]; then
-      if "$FORGE_HOME/bin/forge-skill-install" "$URL" >/dev/null 2>&1; then
-        STATUS="installed"
-      else
-        STATUS="install-failed"
-      fi
-    fi
+    STATUS="queued"  # install the skill yourself: copy its folder into ~/.claude/skills/
     python3 - "$NOW_ISO" "$FROM" "$DESCRIPTION" "$URL" "$STATUS" "$SKILL_QUEUE" <<'PYEOF'
 import json, sys
 ts, frm, desc, url, status, path = sys.argv[1:7]
@@ -710,31 +668,33 @@ PYEOF
   # ── unknown command ──────────────────────────────────────────────────────
   "")
     echo ""
-    echo "Forge is now a 3-sub-agent pipeline. Use these commands:"
+    echo "Forge is a five-agent line (specman, architect, builder, designer, verifier). Use these commands:"
     echo ""
-    echo "  forge-specman \"<fuzzy idea>\"   → draft spec + blind-spot questions"
-    echo "  forge-builder <name>            → scaffold approved spec (all artifacts + one commit)"
-    echo "  forge-designer <name>           → design pass for web-app/web-site specs"
+    echo "  forge-specman \"<fuzzy idea>\"   -> draft spec + blind-spot questions"
+    echo "  forge-architect <name>          -> design doc from the confirmed spec"
+    echo "  forge-builder <name>            -> scaffold approved spec (all artifacts + one commit)"
+    echo "  forge-designer <name>           -> design pass for web-app/web-site specs"
+    echo "  forge-verifier <name>           -> post-build gate (exit 30 = FAIL blocks activation)"
+    echo "  forge-pipeline <name>           -> runs the whole line (--dry-run <name> shows the plan)"
     echo ""
-    echo "Learning / teaching:"
-    echo "  forge-learn all                 → daily self-review for all 3 sub-agents (also runs 2am via launchd)"
-    echo "  forge-teach                     → cross-agent lesson synthesis (also runs 3am via launchd)"
+    echo "Learning:"
+    echo "  forge-learn all                 -> daily self-review for all 5 sub-agents (see docs/SCHEDULING.md)"
     echo ""
-    echo "Skill management:"
-    echo "  forge-skill-install <github-url> → GitHub → validate → install Claude Code skill"
+    echo "Verification front door:"
+    echo "  verify --task <n> --deliverable <path> --donebar <checklist.md>"
     echo ""
     echo "Legacy commands (still work):"
-    echo "  forge new <agent>               → direct scaffold from spec (bypasses SpecMan; advanced use only)"
-    echo "  forge spec                      → print required spec format"
-    echo "  forge validate <agent>          → validate existing scaffold"
+    echo "  forge new <agent>               -> direct scaffold from spec (bypasses SpecMan; advanced use only)"
+    echo "  forge spec                      -> print required spec format"
+    echo "  forge validate <agent>          -> validate existing scaffold"
     echo ""
-    echo "Forge v2 — repair / upgrade / audit existing agents:"
-    echo "  forge audit <agent>             → score one agent against current canon"
-    echo "  forge audit --all               → sweep all real agents, ranked deficit report"
-    echo "  forge upgrade <agent>           → generate upgrade spec for review"
-    echo "  forge sweep                     → audit-all + auto-generate top-3 upgrade specs"
-    echo "  forge skill-request --description \"<gap>\" [--url <github>] [--install]"
-    echo "                                  → log a skill gap; optionally install"
+    echo "Repair / upgrade / audit existing agents:"
+    echo "  forge audit <agent>             -> score one agent against current canon"
+    echo "  forge audit --all               -> sweep all real agents, ranked deficit report"
+    echo "  forge upgrade <agent>           -> generate upgrade spec for review"
+    echo "  forge sweep                     -> audit-all + auto-generate top-3 upgrade specs"
+    echo "  forge skill-request --description \"<gap>\" [--url <github>]"
+    echo "                                  -> log a skill gap"
     echo ""
     exit 0
     ;;

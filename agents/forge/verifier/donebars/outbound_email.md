@@ -6,6 +6,6 @@
 - [ ] Signature block matches the email standards exactly (spacing included)
 - [ ] Brand lint passes for the email channel
 - [ ] Thread behavior correct: replies stay in-thread (reply-all), fresh sends get a clean subject
-- [ ] A Fact-Lock manifest exists and PASSED for this send
-- [ ] The send is staged to Approvals (or the agent holds L2+ with a passing gate) — never fired straight from a draft
+- [ ] A fact-check record exists and PASSED for this send (each name, date, and amount matched to its source)
+- [ ] The send is staged for the operator's approval (or the agent holds L2+ with a passing gate) — never fired straight from a draft
 - [ ] Not a duplicate: no prior send of the same content to the same person

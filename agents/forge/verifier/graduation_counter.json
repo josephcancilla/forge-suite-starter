@@ -10,7 +10,7 @@
     "l2_to_l3": 3
   },
   "promotion_history": [],
-  "notes": "Forge Verifier — post-build gate. L0 on initial ship. Graduates when 3 consecutive zero-edit PASS verdicts are confirmed by the grading agent.",
+  "notes": "Forge Verifier — post-build gate. L0 on initial ship. Graduates when 3 consecutive zero-edit PASS verdicts are confirmed by the operator.",
   "runs": [],
   "graduated_at": null,
   "graduated_by": null

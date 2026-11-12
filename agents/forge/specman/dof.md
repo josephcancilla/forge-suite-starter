@@ -27,4 +27,4 @@
 - `~/.forge-suite/audit/blind-spots/<name>.log` — Q&A record; a monitoring agent audits which skipped questions later caused failures.
 - `~/.forge-suite/memory/lessons/specman_lessons.md` — daily self-review feed.
 
-## Last reviewed: 2026-04-22
+## Last reviewed: 2026-11-11

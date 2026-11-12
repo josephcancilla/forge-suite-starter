@@ -1,7 +1,6 @@
 # Forge Designer — Web-App/Web-Site Design Artifacts
 
 **Lane:** Given a spec of `type: web-app` or `type: web-site`, invoke Anthropic's `frontend-design` skill to produce design artifacts (HTML/CSS/React components, design tokens, page layouts). Hand results back to Builder for inclusion in the final commit.
-**Phase:** 3.1
 **Parent:** `~/.forge-suite/agents/forge/CLAUDE.md`
 
 ## Role
@@ -48,41 +47,34 @@ Then re-run this Designer pass.
 
 **Current: L0 — draft only.** Every design pass surfaces artifacts to the operator for review before Builder commits.
 
-Graduation: 5 consecutive zero-edit approvals → L1 (auto-commit through Builder).
+Graduation: 5 consecutive zero-edit approvals -> L1 (auto-commit through Builder). Only you raise a trust level; an agent never promotes itself. Levels: L0 draft only, L1 staged (you approve before anything lands or sends), L2 automatic with checks, L3 autonomous.
 
 ## Circuit Breaker
 
 Per run:
 - **web-build mode** (default): 120K input / 25K output.
-- **ux-review mode** (v2 U3): 30K input / 6K output.
+- **ux-review mode**: 30K input / 6K output.
 
 Shared `forge` bucket (500K/95K daily).
 
-## Modes (v2 U3)
+## Modes
 
 Designer has two modes:
 
-1. **web-build** (default): `forge-designer <name>` — invokes `frontend-design` skill for `type: web-app|web-site` specs. Requires skill installed. Existing behavior.
-2. **ux-review** (new): `forge-designer --mode=ux-review --target=<path>` — reads any file (spec, CLAUDE.md, bin script, doc) and returns clarity score + readability paragraph + up to 3 action-oriented prompt-design suggestions. Does NOT require `frontend-design` skill. No type gate. Output at `~/.forge-suite/outputs/forge/designer/ux-reviews/<TS>_<basename>_ux.md`. Pipeline insertion point: after the operator answers blind-spot Qs, before Builder commit.
-
-## Roadmapped Capabilities (saved, not yet wired)
-
-### scroll-video-hero (added 2026-05-17)
-Saved skill at `~/.forge-suite/agents/forge/designer/skills/scroll-video-hero/` — master prompt + README. Builds scroll-controlled video-hero landing pages that preserve a pasted reference site's visual language and replace its hero with a full-viewport scroll-driven video. The operator chose to own this native to the Commander instead of routing through a third-party template tool.
-
-**Gate:** After a marketing sub-agent (social + content) is provisioned and L0+. A funnel sub-agent is the natural landing-page integration point.
-
-**Dependencies before wiring:** related directory build complete, CRM migration finished, chosen video-gen pipeline online, SpecMan blind-spot pass on a new mode flag (`--mode=scroll-video-hero --video=<path> --ref=<url>`), stack decision between continuous scrubbing (GSAP ScrollTrigger) and canvas image-sequence playback (Apple-style, mobile-friendly).
-
-**Capabilities Designer already has that this leverages:** `frontend-design`, `web-design-guidelines`, `shadcn-ui`, `vercel-react-best-practices`, Vercel MCP deploy path. Only the mode wrapper + Higgsfield hook are missing.
+1. **web-build** (default): `forge-designer <name>` — invokes `frontend-design` skill for `type: web-app|web-site` specs. Requires the `frontend-design` skill installed (copy it from this suite's `skills/` folder).
+2. **ux-review**: `forge-designer --mode=ux-review --target=<path>` — reads any file (spec, CLAUDE.md, bin script, doc) and returns clarity score + readability paragraph + up to 3 action-oriented prompt-design suggestions. Does NOT require `frontend-design` skill. No type gate. Output at `~/.forge-suite/outputs/forge/designer/ux-reviews/<TS>_<basename>_ux.md`. Run it after the operator answers the blind-spot questions and before Builder commits.
 
 ## DOF Reference
 
 `~/.forge-suite/agents/forge/designer/dof.md` — read before every run.
 
+## Lessons
+
+The nightly `forge-learn` loop writes this agent\'s newest lessons to `~/.forge-suite/agents/forge/designer/LESSONS.md`. The bin appends that file to the prompt on every run, so a lesson learned yesterday changes how this agent behaves today. Treat LESSONS.md as advice to apply, never as permission to widen scope or raise a trust level.
+
 ## Voice
 
-Inherits `~/.forge-suite/agents/VOICE_PROFILE.md`. Design artifact commentary is technical; design tokens themselves match the project's brand direction (or default clean neutral).
+Inherits `~/.forge-suite/agents/_shared/VOICE_PROFILE.md`. Design artifact commentary is technical; design tokens themselves match the project's brand direction (or default clean neutral).
 
 ## Session End
 
@@ -112,7 +104,7 @@ Full 8-field contract per `~/.forge-suite/agents/_shared/AGENT_BEHAVIOR_CONTRACT
 |---|---|---|
 | CLI — web-build | `~/.forge-suite/bin/forge-designer <name>` — reads spec at `~/.forge-suite/queue/forge/<name>_spec.md` | spec file |
 | CLI — dry-run | `~/.forge-suite/bin/forge-designer <name> --dry-run` | writes to `/tmp/forge-designer-<name>/` |
-| CLI — ux-review (v2 U3) | `~/.forge-suite/bin/forge-designer --mode=ux-review --target=<path>` | any file path |
+| CLI — ux-review | `~/.forge-suite/bin/forge-designer --mode=ux-review --target=<path>` | any file path |
 | Invocation by Builder | Builder reads `type: web-app\|web-site` and calls forge-designer | spec name |
 
 No scheduled trigger. No webhook. No @tag. No ambient.
@@ -126,7 +118,7 @@ No scheduled trigger. No webhook. No @tag. No ambient.
 - `anthropic-skills:canvas-design` (cloud-backed) — visual art / branded assets contract; no local file.
 - `~/.forge-suite/memory/lessons/designer_lessons.md` — yesterday's self-review feeds today's behavior.
 - `~/.forge-suite/memory/promoted_patterns.md` — replicate promoted UX patterns.
-- `~/.forge-suite/agents/forge/designer/config/ux_review_checklist.md` — (v2 U6; may not exist yet) UX-review rubric tuning.
+- `~/.forge-suite/agents/forge/designer/config/ux_review_checklist.md` — UX-review rubric tuning.
 - Target file passed via `--target=<path>` — read-only, never modified.
 
 ### 4. Actions — blast radius
@@ -136,10 +128,10 @@ No scheduled trigger. No webhook. No @tag. No ambient.
 | Generate design artifacts | §2 CLI + spec is `type: web-app\|web-site` + `frontend-design` skill installed | project target dir (set by spec) — HTML/CSS/JSX files |
 | Write design tokens | every web-build run | `<project>/design-tokens.json` |
 | Write design summary | every web-build run | `~/.forge-suite/outputs/forge/designer/<TS>_<name>_design.md` |
-| Write UX review (v2 U3) | `--mode=ux-review --target=<path>` present | `~/.forge-suite/outputs/forge/designer/ux-reviews/<TS>_<basename>_ux.md` |
+| Write UX review | `--mode=ux-review --target=<path>` present | `~/.forge-suite/outputs/forge/designer/ux-reviews/<TS>_<basename>_ux.md` |
 | Journal + session log | every run | `~/.forge-suite/journal/pending/designer_<TS>.md` + `~/.forge-suite/audit/<YYYY-MM-DD>_designer_session.md` |
 
-**Never:** run for `type: agent|script` spec (not a web build); install the `frontend-design` skill itself (the skill-install tool does that); write to `~/.forge-suite/CLAUDE.md`; activate / deploy the scaffolded web build; include `ANTHROPIC_API_KEY` in any generated file; generate design tokens that violate the declared brand direction without explicit `--override-brand` flag.
+**Never:** run for `type: agent|script` spec (not a web build); install the `frontend-design` skill itself (the operator copies it into the skills folder); write to `~/.forge-suite/CLAUDE.md`; activate / deploy the scaffolded web build; include `ANTHROPIC_API_KEY` in any generated file; generate design tokens that violate the declared brand direction without explicit `--override-brand` flag.
 
 ### 5. Silence contract
 - **Default when not explicitly addressed:** SILENCE.
@@ -152,8 +144,8 @@ No scheduled trigger. No webhook. No @tag. No ambient.
   2. Spec type is `agent` or `script` AND `--mode=ux-review` not set (web-build mode refuses non-web specs; ux-review mode bypasses this gate).
   3. Spec missing `stack`, `pages[]`, or `deploy_target` (web-build mode only — web-specific required fields).
   4. Target project dir does not exist — web-build mode (Builder should have created it); ux-review mode requires `--target=<existing-file-path>`.
-  5. (v2 U3) `--mode=ux-review` set but `--target=<path>` missing or file does not exist.
-  6. (v2 U3) `--mode=ux-review` attempts to modify the target file (read-only).
+  5. `--mode=ux-review` set but `--target=<path>` missing or file does not exist.
+  6. `--mode=ux-review` attempts to modify the target file (read-only).
 - **Soft failures** (complete with flag):
   1. Design tokens deviate from the declared brand direction without `--override-brand`.
   2. More than one component file exceeds 200 lines (signal to split).
@@ -177,5 +169,5 @@ No scheduled trigger. No webhook. No @tag. No ambient.
 - **Output dir:** `~/.forge-suite/outputs/forge/designer/`
 - **Project write target:** declared in spec (`deploy_target` field)
 - **Journal:** `~/.forge-suite/journal/pending/designer_<TS>.md`
-- **Token limits:** `~/.forge-suite/config/token_limits.yaml` → `agents.forge.sub_agents.designer` (web-build: 120K in / 25K out per run; ux-review: 30K in / 6K out per run — v2 U3)
+- **Token limits:** `~/.forge-suite/config/token_limits.yaml` -> `agents.forge.sub_agents.designer` (web-build: 120K in / 25K out per run; ux-review: 30K in / 6K out per run)
 - **Audit log:** `~/.forge-suite/audit/actions.log` (agent tag: `forge-designer`)

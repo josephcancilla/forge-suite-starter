@@ -5,5 +5,5 @@
 - [ ] Every name, date, and venue matches the event record exactly
 - [ ] Zero em-dashes if the document is client-facing
 - [ ] Required sections all present AND their content is true — structure alone does not pass
-- [ ] Attached to every record the SOP requires in your project tracker (event, company, invoice — per the relevant SOP)
-- [ ] A plain-English comment in your project tracker records what was produced and where it lives
+- [ ] Attached to every record your process requires (for example the job, the client, and the invoice)
+- [ ] A plain-English note in your tracker or log records what was produced and where it lives

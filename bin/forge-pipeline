@@ -3,6 +3,8 @@
 #
 # Usage:
 #   forge-pipeline <name>           Advance the pipeline for <name>; stop at the next gate.
+#   forge-pipeline --dry-run <name> Print the five-stage plan for <name>; runs and writes nothing.
+#   forge-pipeline <name> --mark-active   Record that you activated a verified build.
 #   forge-pipeline --status         Table of all builds in queue/forge/pipeline/.
 #   forge-pipeline --help           Show usage.
 #
@@ -25,11 +27,6 @@
 #   ~/.forge-suite/queue/forge/pipeline/<name>.json
 #   {name, stage, history:[{stage, ts, exit_code, note}]}
 #
-# External tracker sync (optional):
-#   If ~/.forge-suite/state/forge/build_queue_app.json exists, each stage
-#   change updates the matching Build Queue item's status field in your
-#   project-tracking tool (soft — log on fail).
-#
 # Exit codes:
 #   0   stage advanced (or at gate, waiting for the operator)
 #   1   invalid name / I/O error
@@ -42,14 +39,32 @@
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 PIPELINE_DIR="$FORGE_HOME/queue/forge/pipeline"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
-BUILD_QUEUE_STATE="$FORGE_HOME/state/forge/build_queue_app.json"
-ENV_PATH="$FORGE_HOME/config/.env"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-mkdir -p "$PIPELINE_DIR"
+# ── --dry-run: plan only, zero writes, zero sub-agent calls ───────────────────
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DR_NAME="${2:-}"
+  [[ ! "$DR_NAME" =~ ^[a-z][a-z0-9-]+$ ]] && { echo "forge-pipeline: usage: --dry-run <kebab-name>" >&2; exit 1; }
+  DR_SPEC="$FORGE_HOME/queue/forge/${DR_NAME}_spec.md"
+  DR_TYPE="unknown (no spec yet)"
+  if [[ -f "$DR_SPEC" ]]; then
+    DR_TYPE="$(grep -m1 -i -E '^\**type\**[: ]' "$DR_SPEC" | sed 's/.*[: ]//' || true)"
+  fi
+  echo "forge-pipeline DRY RUN for '$DR_NAME' (nothing is run or written; spec type: ${DR_TYPE:-unspecified})"
+  echo "  1. specman    forge-specman --confirm-diagnosis $DR_NAME   (YOUR GATE before: redline the Diagnosis)"
+  echo "  2. architect  forge-architect $DR_NAME                     -> stage designed"
+  echo "  3. builder    forge-builder $DR_NAME                       -> stage built"
+  echo "  4. designer   forge-designer $DR_NAME                      (web-app/web-site only; called by builder in step 3)"
+  echo "  5. verifier   forge-verifier $DR_NAME                      PASS -> verified; FAIL (exit 30) -> stage failed, activation gate NOT reached"
+  echo "  then YOUR GATE: awaiting_activation (forge-pipeline $DR_NAME --mark-active)"
+  exit 0
+fi
+
+mkdir -p "$PIPELINE_DIR" "$(dirname "$AUDIT_LOG")"
 
 die()        { echo "forge-pipeline: $*" >&2; exit 1; }
 log_action() { echo "[$NOW_ISO] forge-pipeline $*" >> "$AUDIT_LOG"; }
@@ -66,7 +81,7 @@ _write_last_run() {
   PIPELINE_LAST_NAME="$name_arg" \
   PIPELINE_LAST_STATE="$state_f" \
   PIPELINE_LAST_TS="$NOW_ISO" \
-  /usr/bin/python3 - <<'PYEOF' 2>/dev/null || true
+  python3 - <<'PYEOF' 2>/dev/null || true
 import json, os
 from pathlib import Path
 p = Path(os.environ["PIPELINE_COUNTER"])
@@ -86,7 +101,7 @@ PYEOF
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
-  sed -n '1,50p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
@@ -102,7 +117,7 @@ if [[ "${1:-}" == "--status" ]]; then
     "------------------------------" "----------------------" "--------------------------"
 
   for f in "$PIPELINE_DIR"/*.json; do
-    /usr/bin/python3 - "$f" <<'PYEOF'
+    python3 - "$f" <<'PYEOF'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text())
@@ -126,17 +141,12 @@ STATE_FILE="$PIPELINE_DIR/${NAME}.json"
 SPEC_FILE="$QUEUE_DIR/${NAME}_spec.md"
 
 # ── Circuit breaker ───────────────────────────────────────────────────────────
-if command -v forge-cb &>/dev/null; then
-  PYTHON_PATH_SAVE="$PATH"
-  export PATH="/usr/bin:/usr/local/bin:$PATH"
-  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
-  export PATH="$PYTHON_PATH_SAVE"
-fi
+forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
 
 # ── State read ────────────────────────────────────────────────────────────────
 _read_stage() {
   if [[ -f "$STATE_FILE" ]]; then
-    /usr/bin/python3 -c \
+    python3 -c \
       "import json; print(json.load(open('${STATE_FILE}')).get('stage','spec_phase1'))" \
       2>/dev/null || echo "spec_phase1"
   else
@@ -157,7 +167,7 @@ _write_state() {
   PIPELINE_EXIT_CODE="$exit_code" \
   PIPELINE_NOTE="$note" \
   PIPELINE_TS="$NOW_ISO" \
-  /usr/bin/python3 - <<'PYEOF'
+  python3 - <<'PYEOF'
 import json, os
 from pathlib import Path
 
@@ -182,155 +192,12 @@ tmp.replace(state_path)
 PYEOF
 }
 
-# ── Tracker stage → status label ──────────────────────────────────────────────
-_tracker_stage_to_status() {
-  case "$1" in
-    spec_phase1)         echo "Spec Drafted" ;;
-    awaiting_redline)    echo "Awaiting Redline" ;;
-    spec_complete)       echo "Spec Drafted" ;;
-    designed)            echo "Designing" ;;
-    built)               echo "Building" ;;
-    failed)              echo "Failed" ;;
-    verified)            echo "Verifying" ;;
-    awaiting_activation) echo "Ready to Activate" ;;
-    active)              echo "Active" ;;
-    *)                   echo "" ;;
-  esac
-}
-
-# ── External tracker soft-update ──────────────────────────────────────────────
-# Finds the Build Queue item by name and updates its status field in your
-# project-tracking tool. Soft: any failure logs and returns 0 (never halts
-# the pipeline). The HTTP calls below are a worked example against a REST
-# API shaped like a typical CRM/work-tracker (OAuth password grant, filter
-# by title, PUT a field value) — swap the URL and env var names for your
-# own tool's API.
-_tracker_update_status() {
-  local new_stage="$1"
-  [[ ! -f "$BUILD_QUEUE_STATE" ]] && return 0
-
-  local status_label
-  status_label="$(_tracker_stage_to_status "$new_stage")"
-  [[ -z "$status_label" ]] && return 0
-
-  # Write the Python script to a temp file to avoid heredoc-inside-function issues
-  local py_tmp
-  py_tmp="$(mktemp /tmp/forge-pipeline-tracker.XXXXXX.py)"
-  trap "rm -f $py_tmp" RETURN
-
-  cat > "$py_tmp" <<'TRACKER_SCRIPT_EOF'
-import json, os, sys, urllib.parse, urllib.request
-from pathlib import Path
-
-build_queue_state = os.environ["TRACKER_BUILD_QUEUE_STATE"]
-env_path          = Path(os.environ["TRACKER_ENV_PATH"])
-status_label      = os.environ["TRACKER_STATUS_LABEL"]
-name              = os.environ["TRACKER_BUILD_NAME"]
-
-build_queue = json.loads(Path(build_queue_state).read_text())
-app_id      = build_queue["app_id"]
-
-env: dict = {}
-if env_path.exists():
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        env[k.strip()] = v.strip().strip('"').strip("'")
-for k in ("TRACKER_CLIENT_ID","TRACKER_CLIENT_SECRET","TRACKER_USERNAME","TRACKER_PASSWORD"):
-    if os.environ.get(k):
-        env[k] = os.environ[k]
-
-required = ["TRACKER_CLIENT_ID","TRACKER_CLIENT_SECRET","TRACKER_USERNAME","TRACKER_PASSWORD"]
-missing = [k for k in required if not env.get(k)]
-if missing:
-    print(f"forge-pipeline: tracker creds missing {missing} — skip", file=sys.stderr)
-    sys.exit(0)
-
-TRACKER_API = "https://api.your-tracker.example"  # replace with your tool's REST API base URL
-
-def _http(method, url, headers=None, data=None, timeout=20):
-    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, (e.read() if hasattr(e, "read") else b"")
-
-body = urllib.parse.urlencode({
-    "grant_type":    "password",
-    "client_id":     env["TRACKER_CLIENT_ID"],
-    "client_secret": env["TRACKER_CLIENT_SECRET"],
-    "username":      env["TRACKER_USERNAME"],
-    "password":      env["TRACKER_PASSWORD"],
-}).encode()
-st, raw = _http("POST", f"{TRACKER_API}/oauth/token",
-    headers={"Content-Type": "application/x-www-form-urlencoded"}, data=body)
-if st != 200:
-    print(f"forge-pipeline: tracker auth failed {st} — skip", file=sys.stderr)
-    sys.exit(0)
-token = json.loads(raw)["access_token"]
-hdrs = {"Authorization": f"OAuth2 {token}", "Content-Type": "application/json"}
-
-def _req(method, path, payload=None, timeout=20):
-    data = json.dumps(payload).encode() if payload else None
-    st, raw = _http(method, f"{TRACKER_API}{path}", headers=hdrs, data=data, timeout=timeout)
-    if st >= 400:
-        raise RuntimeError(f"{method} {path} -> {st}: {raw[:200].decode('utf-8','replace')}")
-    return json.loads(raw) if raw else {}
-
-# Filter Build Queue for item whose title == build name
-result = _req("POST", f"/item/app/{app_id}/filter/",
-    {"filters": {"title": name}, "limit": 10})
-items = result.get("items", [])
-if not items:
-    print(f"forge-pipeline: no Build Queue item for '{name}' — skip tracker update", file=sys.stderr)
-    sys.exit(0)
-
-item_id = items[0]["item_id"]
-
-# Lookup status option_id from app schema
-app_schema = _req("GET", f"/app/{app_id}")
-status_field = next(
-    (f for f in app_schema.get("fields", [])
-     if f.get("external_id") == "status"),
-    None
-)
-if not status_field:
-    print("forge-pipeline: status field not in schema — skip", file=sys.stderr)
-    sys.exit(0)
-
-option = next(
-    (o for o in status_field.get("config", {}).get("settings", {}).get("options", [])
-     if o.get("text") == status_label),
-    None
-)
-if not option:
-    print(f"forge-pipeline: option '{status_label}' not in status field — skip", file=sys.stderr)
-    sys.exit(0)
-
-_req("PUT", f"/item/{item_id}/value/", {"status": [{"value": option["id"]}]})
-print(f"forge-pipeline: tracker item {item_id} → '{status_label}'")
-TRACKER_SCRIPT_EOF
-
-  TRACKER_BUILD_QUEUE_STATE="$BUILD_QUEUE_STATE" \
-  TRACKER_ENV_PATH="$ENV_PATH" \
-  TRACKER_STATUS_LABEL="$status_label" \
-  TRACKER_BUILD_NAME="$NAME" \
-  /usr/bin/python3 "$py_tmp" 2>/dev/null || {
-    log_action "tracker_update_soft_fail name=$NAME stage=$new_stage"
-    echo "forge-pipeline: tracker update failed (soft) — continuing." >&2
-  }
-}
-
 # ── advance helper ────────────────────────────────────────────────────────────
 advance() {
   local new_stage="$1"
   local exit_code="${2:-0}"
   local note="${3:-}"
   _write_state "$new_stage" "$exit_code" "$note"
-  _tracker_update_status "$new_stage"
   log_action "advance name=$NAME stage=$new_stage exit=$exit_code"
   CURRENT_STAGE="$new_stage"
 }
@@ -351,7 +218,6 @@ if [[ -z "$CURRENT_STAGE" ]]; then
     CURRENT_STAGE="spec_phase1"
   fi
   _write_state "$CURRENT_STAGE" 0 "pipeline initialised by forge-pipeline"
-  _tracker_update_status "$CURRENT_STAGE"
   log_action "init name=$NAME stage=$CURRENT_STAGE"
 fi
 
@@ -451,7 +317,7 @@ if [[ "$CURRENT_STAGE" == "built" || "$CURRENT_STAGE" == "failed" ]]; then
     SC=$?
     if [[ $SC -eq 30 ]]; then
       # Iteration cap: 3 build-verify rounds per build, then halt + escalate
-      # to the operator instead of looping forever (verifier hardening 2026-07-03).
+      # to the operator instead of looping forever .
       ATTEMPTS_FILE="$FORGE_HOME/queue/forge/pipeline/${NAME}_verify_attempts"
       VERIFY_ATTEMPTS=$(cat "$ATTEMPTS_FILE" 2>/dev/null || echo 0)
       VERIFY_ATTEMPTS=$((VERIFY_ATTEMPTS + 1))

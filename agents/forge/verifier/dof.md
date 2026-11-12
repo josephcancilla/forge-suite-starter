@@ -9,14 +9,16 @@
 5. `bin/<name> --dry-run` (or `--help` fallback) exits non-zero or times out after 120s — check e FAIL.
 6. `graduation_counter.json` not valid JSON — check f FAIL.
 7. Spec declares MCPs required AND `CLAUDE.md` has no credential pattern declaration — check g FAIL.
+7b. Spec has no passing `## Prior art` section (no search evidence, or no Adopt/Fork/Build decision with a reason) — check h FAIL.
 8. **Wallpaper pass:** Claude verdict PASS but declared outputs from spec do not exist on disk — override to FAIL; do not let structurally-complete-but-content-false artifacts graduate.
 9. **Unnamed failure:** Claude returns FAIL verdict without naming the exact failed check — flag "verdict incomplete" in notes, still exit 30.
-10. Verifier exits 0 (PASS) without having run all seven deterministic checks — broken run, not a pass.
+10. Verifier exits 0 (PASS) without having run all eight deterministic checks (a to h) — broken run, not a pass.
+11. Verifier crashes and leaves no verdict, or leaves an unparseable one. A crash must still produce a parseable FAIL verdict and exit 30.
 
 ## Soft Failures (flag in verdict, do not block)
 
 1. `bin/<name>` has no `--dry-run` flag; fell back to `--help` — note `dry_run_fallback: true` in verdict JSON.
-2. `graduation_counter.json` parses as valid JSON but does not match any recognized shape in `graduation_counters.py` — note in verdict, do not fail.
+2. `graduation_counter.json` parses as valid JSON but has an unfamiliar shape — note it in the verdict, do not fail.
 3. Claude call times out or fails — verdict JSON records `claude_verdict: "error: <message>"` and Verifier exits 30 (conservative: unknown ≠ pass).
 4. Summary `.md` write fails (disk full, permissions) — log to audit, exit with appropriate code; verdict JSON still written if possible.
 
@@ -33,4 +35,4 @@
 - `~/.forge-suite/queue/forge/verdicts/<name>_verdict.json` — machine-readable per-agent verdict history.
 - `~/.forge-suite/outputs/forge/verifier/` — human-readable summaries.
 
-## Last reviewed: 2026-06-10 (initial ship)
+## Last reviewed: 2026-11-11

@@ -1,10 +1,9 @@
 """
 forge_audit.py — Score agents against current canon.
 
-Forge v2. Replaces new-agent-only Forge with audit + upgrade
-capability across the existing roster.
+Lets Forge audit and upgrade existing agents, not only scaffold new ones.
 
-Audits one agent or every real agent dir under ~/.forge-suite/agents/ against 11
+Audits one agent or every real agent dir under $FORGE_HOME/agents/ against 11
 weighted criteria covering CLAUDE.md hygiene, dof.md completeness, bin script
 safety, the 8-field Behavior Contract, Silence Contract, fact-lock retrofit,
 power-down survivability, graduation_counter presence, token tier declaration,
@@ -16,12 +15,12 @@ Score ranges:
     <  60 = NEEDS-UPGRADE
 
 Failures on criteria 5 (Behavior Contract), 7 (Fact-lock), or 8 (Power-down)
-are flagged as "graduation blockers" per Engineering Rules 14/15/16.
+are flagged as "graduation blockers": an agent cannot be promoted past L1 until they pass.
 
 CLI:
-    python3 forge_audit.py <agent>          → JSON for one agent
-    python3 forge_audit.py --all            → JSON list of all real agents
-    python3 forge_audit.py --list-agents    → newline list of real agent names
+    python3 forge_audit.py <agent>          -> JSON for one agent
+    python3 forge_audit.py --all            -> JSON list of all real agents
+    python3 forge_audit.py --list-agents    -> newline list of real agent names
 
 No third-party deps — stdlib only.
 """
@@ -29,6 +28,7 @@ No third-party deps — stdlib only.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field, asdict
@@ -37,14 +37,14 @@ from typing import Optional
 
 
 HOME = Path.home()
-FORGE_SUITE = HOME / ".forge-suite"
+FORGE_SUITE = Path(os.environ.get("FORGE_HOME", HOME / ".forge-suite"))
 AGENTS_DIR = FORGE_SUITE / "agents"
 BIN_DIR = FORGE_SUITE / "bin"
 LIB_DIR = FORGE_SUITE / "lib"
 TOKEN_LIMITS = FORGE_SUITE / "config" / "token_limits.yaml"
 
 # Internal dirs not to be audited as standalone agents
-FORGE_INTERNALS = {"forge/builder", "forge/designer", "forge/specman"}
+FORGE_INTERNALS = {"forge/specman", "forge/architect", "forge/builder", "forge/designer", "forge/verifier", "forge/pipeline"}
 
 # Agents that have no graduation_counter by design (umbrella / non-promotable)
 GRADUATION_EXEMPT = {"forge", "_commander", "_shared", "_templates"}
@@ -187,7 +187,7 @@ def audit_agent(name: str) -> AuditResult:
     dof_md = agent_dir / "dof.md"
     grad_counter = agent_dir / "graduation_counter.json"
 
-    # Bin naming has two conventions in this repo: prefixed <name> (e.g. forge-mailer) and bare <name> (e.g. mailer, scheduler).
+    # Bin naming has two conventions in this repo: prefixed <name> (e.g. forge-builder) and bare <name> (e.g. builder, scheduler).
     bin_candidates = [BIN_DIR / f"forge-{name}", BIN_DIR / name]
     bin_path = next((p for p in bin_candidates if p.exists()), bin_candidates[0])
 

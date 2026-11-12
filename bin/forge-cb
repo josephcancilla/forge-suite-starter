@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""forge-cb - the Forge circuit breaker (daily token cap, stdlib only).
+
+Usage:
+  forge-cb check forge [--input=N] [--output=N]   Record N tokens (default 0) and
+                                                  exit 0 if still under today's cap,
+                                                  exit 3 if the cap is reached.
+  forge-cb status                                 Print today's usage and the caps.
+  forge-cb --help                                 Show this help.
+
+Caps (per local calendar day, shared by every Forge agent):
+  FORGE_CB_INPUT_CAP   default 500000 input tokens
+  FORGE_CB_OUTPUT_CAP  default 95000 output tokens
+
+State lives in $FORGE_HOME/state/forge/cb_<YYYY-MM-DD>.json
+(FORGE_HOME defaults to ~/.forge-suite). Auth: none needed, nothing is sent anywhere.
+"""
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+FORGE_HOME = pathlib.Path(os.environ.get("FORGE_HOME", pathlib.Path.home() / ".forge-suite"))
+INPUT_CAP = int(os.environ.get("FORGE_CB_INPUT_CAP", "500000"))
+OUTPUT_CAP = int(os.environ.get("FORGE_CB_OUTPUT_CAP", "95000"))
+STATE = FORGE_HOME / "state" / "forge" / f"cb_{datetime.date.today().isoformat()}.json"
+
+
+def load() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {"input": 0, "output": 0}
+
+
+def main(argv: list) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "status":
+        d = load()
+        print(f"forge-cb: input {d['input']}/{INPUT_CAP}  output {d['output']}/{OUTPUT_CAP}")
+        return 0
+    if argv[0] != "check":
+        print("forge-cb: unknown command (try --help)", file=sys.stderr)
+        return 1
+    add_in = add_out = 0
+    for a in argv[2:]:
+        if a.startswith("--input="):
+            add_in = int(a.split("=", 1)[1] or 0)
+        elif a.startswith("--output="):
+            add_out = int(a.split("=", 1)[1] or 0)
+    d = load()
+    if d["input"] >= INPUT_CAP or d["output"] >= OUTPUT_CAP:
+        print("forge-cb: daily token cap reached, stopping.", file=sys.stderr)
+        return 3
+    d["input"] += add_in
+    d["output"] += add_out
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(d))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

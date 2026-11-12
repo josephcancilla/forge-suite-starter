@@ -7,4 +7,4 @@
 - [ ] Any comment posted is plain English a teammate would write — no paths, no code-speak, no dumps
 - [ ] Any @-mention uses the format the system requires so the notification actually fires
 - [ ] The item link (real URL from the system) is captured in the run output
-- [ ] For money-adjacent fields: the write went through Fact-Lock + Approvals, not straight to the API
+- [ ] For money-adjacent fields: the value was checked against its source record and staged for the operator's approval, not written straight to the API

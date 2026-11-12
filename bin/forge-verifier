@@ -3,7 +3,7 @@
 #
 # Usage:
 #   forge-verifier <name>           Run all checks + Claude verdict; exit 0=PASS, 30=FAIL
-#   forge-verifier <name> --dry-run Run checks a-g only, skip Claude; write to /tmp/
+#   forge-verifier <name> --dry-run Run checks a-h only, skip Claude; write to /tmp/
 #   forge-verifier --help           Show usage
 #
 # Checks (deterministic, no Claude):
@@ -14,8 +14,12 @@
 #   e. bin/<name> --dry-run exits 0 within 120s (falls back to --help)
 #   f. agents/<name>/graduation_counter.json parses as JSON
 #   g. if spec declares MCPs required, CLAUDE.md declares a credential pattern
+#   h. spec has a passing "Prior art" section (existing tool searched for, Adopt/Fork/Build decision)
 #
 # Then (unless --dry-run): one Claude call judges DOF compliance + spec fidelity.
+#
+# Always returns a verdict: once the spec is found, ANY unexpected internal error
+# still writes a parseable FAIL verdict JSON and exits 30, never an empty result.
 #
 # Outputs:
 #   Verdict JSON:   ~/.forge-suite/queue/forge/verdicts/<name>_verdict.json
@@ -25,7 +29,7 @@
 # Exit codes:
 #   0   PASS
 #   1   internal error (I/O failure, unexpected condition)
-#   20  --help / usage
+#   20  usage (no name given)
 #   21  spec not found
 #   22  invalid name format
 #   30  FAIL (one or more checks failed)
@@ -35,22 +39,24 @@
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 VERDICT_DIR="$FORGE_HOME/queue/forge/verdicts"
 OUTPUT_DIR="$FORGE_HOME/outputs/forge/verifier"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 TIMESTAMP="$(date +%Y%m%d_%H%M)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-mkdir -p "$VERDICT_DIR" "$OUTPUT_DIR"
+mkdir -p "$VERDICT_DIR" "$OUTPUT_DIR" "$(dirname "$AUDIT_LOG")"
 
 die()        { echo "forge-verifier: $*" >&2; exit 1; }
 log_action() { echo "[$NOW_ISO] forge-verifier $*" >> "$AUDIT_LOG"; }
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
-  sed -n '1,32p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  [[ "${1:-}" == "--help" ]] && exit 0
   exit 20
 fi
 
@@ -69,13 +75,8 @@ done
 # Validate name format
 [[ ! "$NAME" =~ ^[a-z][a-z0-9-]+$ ]] && { echo "forge-verifier: invalid kebab-case name: $NAME" >&2; exit 22; }
 
-# Circuit breaker preflight (forge bucket; skip if not installed)
-if command -v forge-cb &>/dev/null; then
-  PYTHON_PATH_SAVE="$PATH"
-  export PATH="/usr/bin:/usr/local/bin:$PATH"
-  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
-  export PATH="$PYTHON_PATH_SAVE"
-fi
+# Circuit breaker preflight (forge bucket; see bin/forge-cb)
+forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
 
 # ── Output destinations ───────────────────────────────────────────────────────
 if $DRY_RUN; then
@@ -121,6 +122,28 @@ else
   echo "forge-verifier: spec not found: $SPEC_FILE — run forge-specman first." >&2
   exit 21
 fi
+
+# ── Crash guard: from here on the verifier always leaves a parseable verdict ───
+VERDICT_WRITTEN=false
+PROMPT_FILE=""
+_on_exit() {
+  local rc=$?
+  [[ -n "$PROMPT_FILE" ]] && rm -f "$PROMPT_FILE"
+  if [[ $rc -ne 0 && $rc -ne 30 && "$VERDICT_WRITTEN" != "true" ]]; then
+    python3 - "$VERDICT_JSON" "$NAME" "$NOW_ISO" "$rc" <<'CRASHPY' || true
+import json, sys
+path, name, ts, rc = sys.argv[1:5]
+with open(path, "w") as f:
+    json.dump({"name": name, "ts": ts, "pass": False, "dry_run": False, "checks": [],
+               "claude_verdict": f"FAIL: forge-verifier crashed before producing a verdict (exit {rc})",
+               "notes": "Internal error. Treat as FAIL. Re-run, or check the audit log."}, f, indent=2)
+CRASHPY
+    log_action "verify_crash name=$NAME exit=$rc verdict_json=$VERDICT_JSON"
+    echo "forge-verifier: FAIL (internal error, exit $rc). Verdict written to $VERDICT_JSON" >&2
+    exit 30
+  fi
+}
+trap _on_exit EXIT
 
 # ── CHECK b: CLAUDE.md exists + has Behavior Contract ────────────────────────
 if [[ ! -f "$CLAUDE_MD" ]]; then
@@ -222,7 +245,7 @@ add_check "e_bin_dry_run" "$CHECK_E_PASS" "$CHECK_E_DETAIL"
 if [[ ! -f "$COUNTER_JSON" ]]; then
   add_check "f_counter_json" "false" "graduation_counter.json missing at $COUNTER_JSON"
 else
-  if /usr/bin/python3 -c "import json,sys; json.load(open('$COUNTER_JSON'))" 2>/dev/null; then
+  if python3 -c "import json,sys; json.load(open('$COUNTER_JSON'))" 2>/dev/null; then
     add_check "f_counter_json" "true" "graduation_counter.json is valid JSON"
   else
     add_check "f_counter_json" "false" "graduation_counter.json exists but is not valid JSON"
@@ -249,6 +272,15 @@ else
   fi
 fi
 
+# ── CHECK h: prior-art section present and passing ───────────────────────────
+if PRIOR_ART_DETAIL="$(python3 "$FORGE_HOME/lib/forge_prior_art.py" "$SPEC_FILE" 2>&1)"; then
+  add_check "h_prior_art" "true" "$PRIOR_ART_DETAIL"
+else
+  # Keep the detail on one line for the JSON check accumulator.
+  PRIOR_ART_DETAIL="$(printf '%s' "$PRIOR_ART_DETAIL" | tr '\n' ' ')"
+  add_check "h_prior_art" "false" "$PRIOR_ART_DETAIL"
+fi
+
 # ── Dry-run path: skip Claude, write verdict ──────────────────────────────────
 CLAUDE_VERDICT=""
 NOTES=""
@@ -260,7 +292,6 @@ else
   # ── Claude call ─────────────────────────────────────────────────────────────
   PROMPT_FILE="$(mktemp /tmp/forge-verifier-prompt.XXXXXX)"
   LOG_FILE="/tmp/forge-verifier-${NAME}-${TIMESTAMP}.log"
-  trap "rm -f $PROMPT_FILE" EXIT
 
   # Gather artifacts for Claude context
   SPEC_CONTENTS="$(cat "$SPEC_FILE")"
@@ -269,13 +300,16 @@ else
   COUNTER_CONTENTS="$([[ -f "$COUNTER_JSON" ]] && cat "$COUNTER_JSON" || echo "(missing)")"
 
   cat "$FORGE_HOME/agents/forge/verifier/CLAUDE.md" > "$PROMPT_FILE"
+  if [[ -f "$FORGE_HOME/agents/forge/verifier/LESSONS.md" ]]; then
+    { printf '\n\n---\n\n## Lessons from earlier runs (read, then apply)\n\n'; cat "$FORGE_HOME/agents/forge/verifier/LESSONS.md"; } >> "$PROMPT_FILE"
+  fi
   cat >> "$PROMPT_FILE" <<VERIFIER_TASK
 
 ---
 
 ## TASK — Verify: $NAME
 
-Your role: ASSUME this scaffold is broken. Find the specific way it fails the spec or the DOF — do not confirm it looks complete. A structurally complete scaffold that declares false capabilities MUST fail. Judge DOF compliance and spec fidelity for the scaffolded agent "$NAME" from that posture.
+Your role: ASSUME this scaffold is broken. Find the specific way it fails the spec or the DOF — do not confirm it looks complete. A structurally complete scaffold that declares false capabilities MUST fail. Judge DOF compliance, spec fidelity, and the prior-art decision for the scaffolded agent "$NAME" from that posture.
 
 ### Deterministic check results (already computed)
 ${CHECKS_JSON}
@@ -297,6 +331,7 @@ $COUNTER_CONTENTS
 1. Read the spec, CLAUDE.md, and dof.md carefully.
 2. Judge DOF compliance: does the dof.md contain all 5 required sections (Hard Failures, Soft Failures, Not Failures, Monitoring, Last Reviewed)? Are the Hard Failures specific and named (not vague)?
 3. Judge spec fidelity: does the scaffolded CLAUDE.md match the spec's declared Lane, Trust Ladder start (L0), MCPs, Token tier, Cognitive tier, and 8-field Behavior Contract?
+3b. Judge the prior-art section: does it show a real search for an existing tool or skill, and does the Adopt/Fork/Build decision follow from what was found?
 4. Wallpaper check: does the CLAUDE.md declare output paths that actually exist? (Declared paths in Behavior Contract §8 Deployment — if they are runtime-created paths like output dirs, this is not a failure; if the file itself should have been scaffolded, check it.)
 5. Return your verdict as a single JSON object — no prose outside the JSON:
 
@@ -317,19 +352,19 @@ VERIFIER_TASK
 
   log_action "verify_start $NAME"
 
-  CLAUDE_RAW="$("$CLAUDE_BIN" --model claude-sonnet-5 \
+  CLAUDE_RAW="$("$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
     --permission-mode bypassPermissions \
     --output-format text \
-    -p "$(cat "$PROMPT_FILE")" 2>"$LOG_FILE" || echo '{"pass":false,"claude_verdict":"error: Claude call failed","notes":"See log: '"$LOG_FILE"'"}')"
+    -p < "$PROMPT_FILE" 2>"$LOG_FILE" || echo '{"pass":false,"claude_verdict":"error: Claude call failed","notes":"See log: '"$LOG_FILE"'"}')"
 
   # Extract pass + verdict from Claude output (strip any accidental markdown fences)
   CLAUDE_JSON="$(echo "$CLAUDE_RAW" | sed 's/^```json//; s/^```//; s/```$//' | tr -d '\r')"
 
-  CLAUDE_VERDICT_FIELD="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+  CLAUDE_VERDICT_FIELD="$(echo "$CLAUDE_JSON" | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print(d.get('claude_verdict',''))" 2>/dev/null || echo "error: parse failed")"
-  CLAUDE_PASS_FIELD="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+  CLAUDE_PASS_FIELD="$(echo "$CLAUDE_JSON" | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print('true' if d.get('pass') else 'false')" 2>/dev/null || echo "false")"
-  NOTES="$(echo "$CLAUDE_JSON" | /usr/bin/python3 -c \
+  NOTES="$(echo "$CLAUDE_JSON" | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print(d.get('notes',''))" 2>/dev/null || echo "")"
 
   CLAUDE_VERDICT="$CLAUDE_VERDICT_FIELD"
@@ -350,10 +385,10 @@ DRY_RUN_STR="false"
 $DRY_RUN && DRY_RUN_STR="true"
 
 # Escape strings for embedding in the Python heredoc
-CLAUDE_VERDICT_ESC="$(echo "$CLAUDE_VERDICT" | /usr/bin/python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
-NOTES_ESC="$(echo "$NOTES" | /usr/bin/python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
+CLAUDE_VERDICT_ESC="$(echo "$CLAUDE_VERDICT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
+NOTES_ESC="$(echo "$NOTES" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")"
 
-/usr/bin/python3 - <<PYEOF
+python3 - <<PYEOF
 import json
 # Embed booleans via JSON parse so True/False capitalisation is Python-correct
 pass_val   = json.loads("$PASS_STR")
@@ -374,13 +409,14 @@ with open("$VERDICT_JSON", "w") as f:
     json.dump(verdict, f, indent=2)
 print("verdict JSON written")
 PYEOF
+VERDICT_WRITTEN=true
 
 # ── Write human summary ───────────────────────────────────────────────────────
 PASS_LABEL="PASS"
 $OVERALL_PASS || PASS_LABEL="FAIL"
 
 # Pre-compute checks table (avoids nested heredoc issues)
-CHECKS_TABLE="$(echo "$CHECKS_JSON" | /usr/bin/python3 -c "
+CHECKS_TABLE="$(echo "$CHECKS_JSON" | python3 -c "
 import sys, json
 checks = json.loads('[' + sys.stdin.read() + ']')
 for c in checks:

@@ -31,19 +31,21 @@
 #   3   circuit breaker tripped
 #   20  Diagnosis drafted (Phase 1), awaiting redline + --confirm-diagnosis
 #   21  --confirm-diagnosis called but Diagnosis placeholder not redlined
+#   23  finalized spec fails the required prior-art check (lib/forge_prior_art.py)
 #
 # Auth: Claude Code subscription only. No ANTHROPIC_API_KEY.
 
 set -euo pipefail
 
 FORGE_HOME="${FORGE_HOME:-$HOME/.forge-suite}"
+export PATH="$FORGE_HOME/bin:$PATH"
 QUEUE_DIR="$FORGE_HOME/queue/forge"
 OUTPUT_DIR="$FORGE_HOME/outputs/forge/specman"
 BLINDSPOT_DIR="$FORGE_HOME/audit/blind-spots"
 JOURNAL_DIR="$FORGE_HOME/journal/pending"
 AUDIT_LOG="$FORGE_HOME/audit/actions.log"
 DIAGNOSIS_LOG="$FORGE_HOME/memory/diagnosis_patterns.md"
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 TIMESTAMP="$(date +%Y%m%d_%H%M)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -53,7 +55,7 @@ die() { echo "forge-specman: $*" >&2; exit 1; }
 log_action() { echo "[$NOW_ISO] forge-specman $*" >> "$AUDIT_LOG"; }
 
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
-  sed -n '1,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
@@ -87,18 +89,23 @@ for arg in "$@"; do
   esac
 done
 
-# Circuit breaker preflight (pin /usr/bin/python3 so PyYAML resolves correctly
-# even when Homebrew python3 is earlier in PATH)
-if command -v forge-cb &>/dev/null; then
-  PYTHON_PATH_SAVE="$PATH"
-  export PATH="/usr/bin:/usr/local/bin:$PATH"
-  forge-cb check forge || { export PATH="$PYTHON_PATH_SAVE"; log_action "circuit_breaker_tripped"; exit 3; }
-  export PATH="$PYTHON_PATH_SAVE"
-fi
+# Circuit breaker preflight (daily token cap; see bin/forge-cb)
+forge-cb check forge || { log_action "circuit_breaker_tripped"; exit 3; }
 
 PROMPT_FILE="$(mktemp /tmp/specman-prompt.XXXXXX)"
 LOG_FILE="/tmp/forge-specman-${TIMESTAMP}.log"
 trap "rm -f $PROMPT_FILE" EXIT
+
+# Prior art: both phases share one required section template (checked by lib/forge_prior_art.py).
+PRIOR_ART_TEMPLATE=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from forge_prior_art import SECTION_TEMPLATE; print(SECTION_TEMPLATE)' "$FORGE_HOME/lib")
+
+# Lessons written by forge-learn reach this run: append them to the prompt when present.
+add_lessons() {
+  local f="$FORGE_HOME/agents/forge/specman/LESSONS.md"
+  if [[ -f "$f" ]]; then
+    { printf '\n\n---\n\n## Lessons from earlier runs (read, then apply)\n\n'; cat "$f"; } >> "$PROMPT_FILE"
+  fi
+}
 
 # ========== PHASE 2: --confirm-diagnosis ==========
 if $CONFIRM_MODE; then
@@ -116,6 +123,7 @@ if $CONFIRM_MODE; then
   fi
 
   cat "$FORGE_HOME/agents/forge/specman/CLAUDE.md" > "$PROMPT_FILE"
+add_lessons
   cat >> "$PROMPT_FILE" <<SPECMAN_PHASE2
 
 ---
@@ -129,18 +137,27 @@ $(cat "$SPEC_FILE")
 
 Required actions (execute in order using Edit/Write tools):
 
+**Prior art (required):** before building something new, look for an existing tool, skill,
+library, or open-source project that already does the job (search the web and GitHub, and
+check the skills already installed). The spec must contain the section below, filled with
+what you found (links) or what you searched for and why nothing fit, and an Adopt, Fork,
+or Build decision with at least three words explaining why. Phase 2 is refused until the
+section passes.
+
+$PRIOR_ART_TEMPLATE
+
 1. **Preserve the Diagnosis section verbatim.** Your redlines are authoritative. Do not edit.
 2. **Use your confirmed Diagnosis as seed** for the rest of the spec. The "Alternative framings" and "What would have to be true for this NOT to be the right build" lines constrain scope and reveal edges — fold those into Hard/Soft failures and Blind-Spot questions.
 3. **Fill all 10 fields** (Agent/Build name, Lane, Cadence, Inputs, Outputs, Reporting line, MCPs, Token tier, **Cognitive tier**, Hard/Soft failures) + 8-field Behavior Contract + type-specific fields. Tag inferred fields with \`# inferred\`.
 
-   **Cognitive tier** (REQUIRED, since 2026-05-04 Wave 2): one of \`opus | sonnet | haiku | no-llm\` + one-sentence justification. Source of truth: $FORGE_HOME/config/model-routing.md.
+   **Cognitive tier** (REQUIRED): one of \`opus | sonnet | haiku | no-llm\` + one-sentence justification.
    - opus = voice / multi-step reasoning / strategic synthesis
    - sonnet = formatting / light synthesis the operator reviews
    - haiku = classification / sync / health check / synthesis the operator does NOT read
    - no-llm = pure shell/Node/Python; never spawns \`claude\`
-   - **Verification: bin-level audit confirms tier assignment matches actual claude invocation pattern. Schedule frequency ≠ LLM call frequency.** A plist that fires every 30 min is not a high-cost agent if its bin is shell-first and only calls claude on specific triggers. Before assigning \`haiku\` for cost-savings reasons, read the bin and confirm: (a) it actually invokes claude, and (b) how often per fire. A prior audit wave caught several bins that didn't invoke claude at all.
-   - **Off-manifest agents (those invoked downstream of a plist rather than scheduled directly) must be declared in their parent plist's spec under a \`Spawns\` field.** A plist's bin that orchestrates (e.g. a pipeline bin calling a triage agent then a drafting agent) must enumerate every child it invokes, the child's bin path, and the child's cognitive tier. Manifest tracking requires plist + spawned-children visibility so every claude invocation site shows up in \`~/.forge-suite/config/model-routing.md\` (per-agent table OR the Off-manifest section). This requirement was introduced after an audit found an off-manifest orchestrator agent racking up the single largest model-cost drain, untracked.
-   - **Runtime verification required.** Read a log line from a real launchd-fired run confirming the actual model invoked. Bin code review (Bin-verified) is necessary but not sufficient — bins that source config files (\`.env\`, etc.) can have silently overridden launchd env vars. Mark \`Runtime-verified=yes\` only after reading a log entry from a real fire. Reference incident: a legacy triage agent shipped an env-var-aware patch; the first real fire showed the wrong model invoked because \`.env\` was sourced post-launchd-env and clobbered the plist value. See \`model-routing.md\` Env-var precedence section + Rollout history.
+   - **Verify the tier against the script.** How often a job is scheduled is not how often it calls the model. Before picking \`haiku\` to save cost, read the script and confirm (a) it actually invokes claude and (b) how often per run.
+   - **Declare spawned children.** A script that orchestrates other agents must list every child it invokes, the child's path, and the child's tier, so every model call site is visible.
+   - **Runtime verification.** Mark a tier verified only after reading a log line from a real run that shows the model actually used. Reading the code is necessary but not sufficient, because config files can silently override what the code asks for.
 4. **Run 5-pass blind-spot protocol.** 2–5 total questions across: edge cases, 10X adjacencies, failure-mode gaps, UX/second-order, ecosystem fit. Must be SPECIFIC to this build. Include in \`## Blind-Spot Questions (SpecMan's 5-pass)\` section.
 5. **Seed blind-spot log** at $BLINDSPOT_DIR/${CONFIRM_NAME}.log — one line per question in canonical format:
    \`[<ISO>] ${CONFIRM_NAME} question_NN "<question>" answered "<awaiting>" gap=null skip_clean=null\`
@@ -151,10 +168,10 @@ Required actions (execute in order using Edit/Write tools):
 Reference patterns:
 - 9-field spec + 8-field Behavior Contract: $FORGE_HOME/agents/_shared/AGENT_BEHAVIOR_CONTRACT.md
 - Silence rule: $FORGE_HOME/agents/_shared/silence_rule.md
-- Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
-- Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
+- Promoted patterns (if the file exists): $FORGE_HOME/memory/promoted_patterns.md
+- Demoted patterns (if the file exists): $FORGE_HOME/memory/demoted_patterns.md
 - Prior SpecMan lessons: $FORGE_HOME/memory/lessons/specman_lessons.md
-- Blind-spot patterns (v2 U5 signal, may be empty): $FORGE_HOME/memory/blind_spot_patterns.md
+- Blind-spot patterns (may not exist yet): $FORGE_HOME/memory/blind_spot_patterns.md
 
 Hard constraints:
 - Do NOT overwrite the \`## Diagnosis\` section — it's already been redlined.
@@ -167,10 +184,10 @@ SPECMAN_PHASE2
   RUN_START_EPOCH="$(date +%s)"
   export RUN_START_EPOCH FORGE_HOME
 
-  "$CLAUDE_BIN" --model claude-sonnet-5 \
+  "$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
     --permission-mode bypassPermissions \
     --output-format text \
-    -p "$(cat "$PROMPT_FILE")" \
+    -p < "$PROMPT_FILE" \
     > /dev/null 2>"$LOG_FILE" || {
     log_action "confirm_error $CONFIRM_NAME see_log=$LOG_FILE"
     echo "forge-specman: Phase 2 Claude run failed. See log: $LOG_FILE" >&2
@@ -178,9 +195,7 @@ SPECMAN_PHASE2
   }
 
   # Post-run fallback: seed blind-spot log if subprocess skipped it.
-  PATH_SAVE="$PATH"
-  export PATH="/usr/bin:/usr/local/bin:$PATH"
-  /usr/bin/python3 - <<'PYEOF' || true
+  python3 - <<'PYEOF' || true
 import os, re, time, sys
 from pathlib import Path
 
@@ -224,12 +239,16 @@ for spec_path in queue_dir.glob("*_spec.md"):
     log_path.write_text("\n".join(out) + "\n")
     print(f"forge-specman: fallback-seeded blind-spot log for {name} ({len(questions)} Qs)", file=sys.stderr)
 PYEOF
-  export PATH="$PATH_SAVE"
 
   # Append diagnosis_confirmed event to diagnosis_patterns.md
+  if ! python3 "$FORGE_HOME/lib/forge_prior_art.py" "$SPEC_FILE"; then
+    log_action "prior_art_gate_fail $CONFIRM_NAME"
+    exit 23
+  fi
+
   if [[ -f "$DIAGNOSIS_LOG" ]]; then
-    DIAG_EXCERPT=$(/usr/bin/awk '/^## Diagnosis/,/^## (Cadence|Blind-Spot|Behavior|Hard failures)/' "$SPEC_FILE" \
-      | /usr/bin/sed 's/|/\\|/g' | /usr/bin/tr '\n' ' ' | /usr/bin/head -c 200)
+    DIAG_EXCERPT=$(awk '/^## Diagnosis/,/^## (Cadence|Blind-Spot|Behavior|Hard failures)/' "$SPEC_FILE" \
+      | sed 's/|/\\|/g' | tr '\n' ' ' | head -c 200)
     echo "| $NOW_ISO | $CONFIRM_NAME | diagnosis_confirmed | (see spec) | ${DIAG_EXCERPT}... | pending | operator-confirmed; awaiting build |" >> "$DIAGNOSIS_LOG"
   fi
 
@@ -246,7 +265,7 @@ fi
 
 # ========== PHASE 1: Diagnosis draft ==========
 
-# U4 — Skill Discovery: build existing-capabilities inventory so the LLM can
+# Existing-capabilities inventory: so the LLM can
 # detect overlaps during Diagnosis ("cheaper/existing-thing-overlooked" check).
 # Pure plumbing — no new sections, no output changes, just richer LLM context.
 EXISTING_BINS=$(ls "$FORGE_HOME/bin/" 2>/dev/null | grep -v '\.bak\|\.example' | sort | tr '\n' ' ')
@@ -254,6 +273,7 @@ EXISTING_AGENTS=$(ls "$FORGE_HOME/agents/" 2>/dev/null | grep -v '^_' | sort | t
 INSTALLED_SKILLS=$(ls "$HOME/.claude/skills/" 2>/dev/null | sort | tr '\n' ' ' || echo "(none)")
 
 cat "$FORGE_HOME/agents/forge/specman/CLAUDE.md" > "$PROMPT_FILE"
+add_lessons
 cat >> "$PROMPT_FILE" <<SPECMAN_PHASE1
 
 ---
@@ -271,10 +291,18 @@ Target spec file: ${DRY_RUN:+/tmp/specman-<name>/<name>_spec.md or }$QUEUE_DIR/<
 
 Required actions (execute in order using Write tool):
 
+**Prior art (required):** before designing anything new, search for an existing tool, skill,
+library, or open-source project that already does this (web search, GitHub, and the skills
+already installed). The spec skeleton must also contain the section below, filled with links
+or with what you searched for and why nothing fit, plus an Adopt, Fork, or Build decision with
+at least three words explaining why. It sits alongside the Diagnosis skeleton.
+
+$PRIOR_ART_TEMPLATE
+
 1. **Parse the fuzzy idea.** Extract target name (kebab-case), type (agent/script/web-app/web-site), one-sentence lane.
-2. **Collision check.** Refuse if $FORGE_HOME/agents/<name>/ OR $HOME/.forge-suite/bin/<name> exists. Write gap note + stop (exit via die, not spec).
-3. **Demotion check.** Read $FORGE_HOME/memory/demoted_patterns.md. If idea invokes a demoted pattern, refuse (the operator did not pass --override-demotion).
-4. **Write DIAGNOSIS-ONLY spec skeleton.** This is v2 U1 — Phase 1 stops after Diagnosis. Fill ONLY:
+2. **Collision check.** Refuse if $FORGE_HOME/agents/<name>/ OR $FORGE_HOME/bin/<name> exists. Write gap note + stop (exit via die, not spec).
+3. **Demotion check.** If $FORGE_HOME/memory/demoted_patterns.md exists, read it. If the idea invokes a demoted pattern, refuse unless the operator explicitly overrode it in the idea text.
+4. **Write DIAGNOSIS-ONLY spec skeleton.** Phase 1 stops after Diagnosis. Fill ONLY:
    - YAML frontmatter (type, name, status: draft, generated_by, generated, phase: diagnosis)
    - \`## Agent name\` / \`## Build name\` (kebab-case)
    - \`## Lane\` (one sentence)
@@ -311,16 +339,16 @@ Reference patterns:
 - 9-field spec + 8-field Behavior Contract: $FORGE_HOME/agents/_shared/AGENT_BEHAVIOR_CONTRACT.md
 - Promoted patterns: $FORGE_HOME/memory/promoted_patterns.md
 - Demoted patterns: $FORGE_HOME/memory/demoted_patterns.md
-- Diagnosis examples: $FORGE_HOME/memory/diagnosis_patterns.md (may be empty — v2 U1 just launched)
+- Diagnosis examples: $FORGE_HOME/memory/diagnosis_patterns.md (may not exist yet)
 
-Existing capabilities inventory (v2 U4 — Skill Discovery):
+Existing capabilities inventory (prior-art input):
 Use this list when writing the "What would have to be true for this NOT to be the right build" bullets.
 If the fuzzy idea overlaps with an existing bin or agent, name it specifically in the overlap bullet.
 
-Existing bins (~/.forge-suite/bin/):
+Existing bins ($FORGE_HOME/bin/):
 $EXISTING_BINS
 
-Existing agents (~/.forge-suite/agents/):
+Existing agents ($FORGE_HOME/agents/):
 $EXISTING_AGENTS
 
 Installed Claude skills (~/.claude/skills/):
@@ -341,10 +369,10 @@ export RUN_START_EPOCH FORGE_HOME
 
 rm -f /tmp/forge-specman-last-name
 
-"$CLAUDE_BIN" --model claude-sonnet-5 \
+"$CLAUDE_BIN" --model "${FORGE_MODEL:-claude-sonnet-5}" \
   --permission-mode bypassPermissions \
   --output-format text \
-  -p "$(cat "$PROMPT_FILE")" \
+  -p < "$PROMPT_FILE" \
   > /dev/null 2>"$LOG_FILE" || {
   log_action "diagnosis_error see_log=$LOG_FILE"
   echo "forge-specman: Phase 1 Claude run failed. See log: $LOG_FILE" >&2

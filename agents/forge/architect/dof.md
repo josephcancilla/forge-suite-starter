@@ -2,7 +2,7 @@
 
 ## Hard Failures (agent is broken, rebuild required)
 - Spec file missing at `~/.forge-suite/queue/forge/<name>_spec.md` (should refuse, exit 22).
-- Spec Diagnosis still contains `<AWAITING OPERATOR CONFIRM OR REDIRECT>` placeholder (should refuse, exit 21).
+- Spec Diagnosis still contains `<AWAITING CONFIRM OR REDIRECT>` placeholder (should refuse, exit 21).
 - Design doc missing any required section: Components, Data/State Files, Dependencies, Integration Points, Risks, Verification Plan.
 - Design doc invents dependencies, MCPs, or credentials not mentioned in the spec.
 - Output written outside declared paths (`queue/forge/designs/` and `outputs/forge/architect/`).
@@ -29,4 +29,4 @@
 - `~/.forge-suite/queue/forge/designs/<name>_design.md` — primary output; absence after a run is a hard failure.
 - `~/.forge-suite/outputs/forge/architect/<TS>_<name>_design_summary.md` — run summary for operator review.
 
-## Last reviewed: 2026-06-10 (initial ship)
+## Last reviewed: 2026-11-11

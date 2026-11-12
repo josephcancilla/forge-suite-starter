@@ -5,7 +5,7 @@ Reads an AuditResult dict (from forge_audit.py) and produces a markdown spec
 listing every FAILed criterion with a concrete patch instruction. The spec
 lands in ~/.forge-suite/queue/forge/<agent>_upgrade_spec.md (or /tmp if --dry-run).
 
-Forge L0 contract: spec is drafted, the operator approves. Apply step deferred to v2.1.
+Forge L0 contract: spec is drafted, the operator approves. You apply the patches yourself.
 
 CLI:
     python3 forge_upgrade_spec.py <agent> [--dry-run]
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 HOME = Path.home()
-FORGE_SUITE = HOME / ".forge-suite"
+FORGE_SUITE = Path(os.environ.get("FORGE_HOME", HOME / ".forge-suite"))
 QUEUE_DIR = FORGE_SUITE / "queue" / "forge"
 AUDIT_DIR = FORGE_SUITE / "outputs" / "forge" / "audit"
 
@@ -45,8 +45,8 @@ def _patch_for_criterion(c: dict, agent: str) -> str:
             f"- **Current:** {notes}\n"
             f"- **Required:** CLAUDE.md with at least 10 lines documenting role, trust level, output paths, "
             f"and the 8-field Behavior Contract.\n"
-            f"- **Patch:** Restore from latest backup or scaffold from `~/.forge-suite/agents/_templates/`. "
-            f"If agent is being retired, run `forge-retire {agent}` (agent lifecycle tooling)."
+            f"- **Patch:** Restore from the latest backup or re-scaffold with `forge new`. "
+            f"If the agent is being retired, move its folder out of agents/ instead."
         )
     if n == 2:
         return (
@@ -93,22 +93,22 @@ def _patch_for_criterion(c: dict, agent: str) -> str:
             f"- **Files:** `{bin_path}`, `~/.forge-suite/lib/{agent}_factlock.py` (new if outbound writes), `{claude_md}`\n"
             f"- **Current:** {notes}\n"
             f"- **Required:** Outbound-writing agent must import a `factlock` module and call `verify_facts()` before every CRM comment, email, file write, or status flip. Read-only agents declare `fact_lock_exempt: read-only` in CLAUDE.md.\n"
-            f"- **Patch:** If agent writes outbound: model on an existing outbound agent's fact-lock module in `~/.forge-suite/lib/` — build manifest from FactClaim list and call `verify_facts()` before action. If read-only: add a one-line `fact_lock_exempt: read-only` to CLAUDE.md frontmatter. Blocks promotion to L2+ per Engineering Rule 15."
+            f"- **Patch:** If agent writes outbound: add a small check that compares every name, date, and amount in the output to its source record, and refuse to send if any claim does not match. If read-only: add a one-line `fact_lock_exempt: read-only` to CLAUDE.md frontmatter. Blocks promotion to L2+."
         )
     if n == 8:
         return (
             f"- **File:** `{claude_md}`\n"
             f"- **Section:** New section or update existing schedule docs\n"
             f"- **Current:** {notes}\n"
-            f"- **Required:** Declare ONE power-down pattern per Engineering Rule 14: (a) day-keyed output guard, (b) time-window guard (5-22 PHX), (c) inherent idempotency (cooldown-ledger), or (d) no-schedule (manual/CLI only).\n"
+            f"- **Required:** Declare ONE power-down pattern, so a restart or a missed run cannot double-fire: (a) day-keyed output guard, (b) time-window guard (only run during set hours), (c) inherent idempotency (cooldown ledger), or (d) no-schedule (manual/CLI only).\n"
             f"- **Patch:** Add a `## Power-down survivability` section stating which pattern this agent uses and where the guard lives (bin line / ledger path / cron-only). Blocks promotion to L2+."
         )
     if n == 9:
         return (
             f"- **File:** `~/.forge-suite/agents/{agent}/graduation_counter.json`\n"
             f"- **Current:** {notes}\n"
-            f"- **Required:** A graduation_counter.json with keys `current_tier`, `clean_runs`, `required_clean_runs` per `~/.forge-suite/policy/grader_criteria_l0_l1.md`.\n"
-            f"- **Patch:** Run your graduation tracker's init command for {agent} (if available) or copy from a peer agent's counter and reset clean_runs=0."
+            f"- **Required:** A graduation_counter.json with keys `current_tier`, `clean_runs`, `required_clean_runs`.\n"
+            f"- **Patch:** Copy a peer agent's graduation_counter.json and reset the clean-run counts to 0."
         )
     if n == 10:
         return (
@@ -182,12 +182,12 @@ def generate_spec(agent: str, audit: dict, dry_run: bool = False) -> str:
         for b in audit["blockers"]:
             lines.append(f"- {b}")
         lines.append("")
-        lines.append("These FAILs block promotion to L2+ per Engineering Rules 14/15/16.")
+        lines.append("These FAILs block promotion to L2+ until they pass.")
         lines.append("")
 
     lines.append("## Backfill plan")
     lines.append("")
-    lines.append(f"Before any in-place edit, write backups to `/tmp/forge-upgrade-{agent}-{ts}/<filename>.bak` per Engineering Rule 10.")
+    lines.append(f"Before any in-place edit, write a backup to `/tmp/forge-upgrade-{agent}-{ts}/<filename>.bak`.")
     lines.append("")
 
     lines.append("## Operator approval")
